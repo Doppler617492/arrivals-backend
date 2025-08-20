@@ -1,8 +1,24 @@
-version: '3'
+version: "3.9"
+
 services:
-  web:
-    build: .
+  backend:  # Production-like (Gunicorn)
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
-      - "8080:5000"
+      - "5000:5000"
+    env_file:
+      - .env  # optional; if you have DB URL, CORS origins, etc.
+    restart: unless-stopped
+
+  backend-dev:  # Hot-reload dev server
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5001:5000"   # dev on 5001 to avoid clashing with prod
     volumes:
-      - .:/app
+      - .:/app        # live code mount
+    env_file:
+      - .env          # optional
+    restart: unless-stopped
