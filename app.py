@@ -33,6 +33,9 @@ upload_dir_env = os.environ.get('UPLOAD_DIR') or os.environ.get('UPLOAD_FOLDER')
 app.config['UPLOAD_FOLDER'] = upload_dir_env or os.path.join(os.path.dirname(__file__), 'uploads')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
+# Limit upload size via env (default 16 MB)
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', '16')) * 1024 * 1024
+
 # Mail / SLA
 SMTP_HOST = os.environ.get('SMTP_HOST')
 SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
@@ -45,7 +48,47 @@ NOTIFY_ON_SLA = os.environ.get('NOTIFY_ON_SLA', 'true').lower() == 'true'
 SLA_CHECK_SECONDS = int(os.environ.get('SLA_CHECK_SECONDS', '3600'))
 
 jwt = JWTManager(app)
+
+# JWT error/unauthorized handlers
+@jwt.unauthorized_loader
+def _jwt_unauthorized(err_str):
+    return jsonify({"error": "Missing or invalid auth", "detail": err_str}), 401
+
+@jwt.invalid_token_loader
+def _jwt_invalid(reason):
+    return jsonify({"error": "Invalid token", "detail": reason}), 401
+
+@jwt.expired_token_loader
+def _jwt_expired(jwt_header, jwt_payload):
+    return jsonify({"error": "Token expired"}), 401
+
+@jwt.needs_fresh_token_loader
+def _jwt_needs_fresh(jwt_header, jwt_payload):
+    return jsonify({"error": "Fresh token required"}), 401
+
 db = SQLAlchemy(app)
+
+# API-friendly error handlers
+@app.errorhandler(400)
+def _bad_request(e):
+    return jsonify({"error": "Bad request"}), 400
+
+@app.errorhandler(403)
+def _forbidden(e):
+    return jsonify({"error": "Forbidden"}), 403
+
+@app.errorhandler(404)
+def _not_found(e):
+    # If the path looks like API, respond JSON; otherwise fall back to default Flask index
+    return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(405)
+def _method_not_allowed(e):
+    return jsonify({"error": "Method not allowed"}), 405
+
+@app.errorhandler(413)
+def _too_large(e):
+    return jsonify({"error": "File too large"}), 413
 
 # --- Models ---
 class User(db.Model):
@@ -266,6 +309,21 @@ def auth_login():
     token = create_access_token(identity=identity, additional_claims=claims)
     return jsonify({'access_token': token, 'user': {'id': user.id, 'email': user.email, 'name': user.name, 'role': user.role}})
 
+# Refresh endpoint for JWT
+@app.route('/auth/refresh', methods=['POST'])
+@jwt_required()
+def auth_refresh():
+    claims = get_jwt() or {}
+    uid = get_jwt_identity()
+    if uid is None:
+        return jsonify({"error": "Unauthorized"}), 401
+    new_token = create_access_token(identity=str(uid), additional_claims={
+        "email": claims.get("email"),
+        "name": claims.get("name"),
+        "role": claims.get("role", "viewer"),
+    })
+    return jsonify({"access_token": new_token})
+
 @app.route('/auth/me', methods=['GET'])
 @jwt_required()
 def auth_me():
@@ -318,6 +376,43 @@ def delete_user(uid):
     db.session.delete(u)
     db.session.commit()
     return jsonify({'ok': True})
+
+# Admin: get single user
+@app.route('/users/<int:uid>', methods=['GET'])
+@jwt_required()
+def get_user(uid):
+    claims = get_jwt()
+    if claims.get('role') != 'admin':
+        return jsonify({'error': 'Forbidden'}), 403
+    u = User.query.get(uid)
+    if not u:
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify({'id': u.id, 'email': u.email, 'name': u.name, 'role': u.role})
+
+# Admin: update single user
+@app.route('/users/<int:uid>', methods=['PATCH'])
+@jwt_required()
+def update_user(uid):
+    claims = get_jwt()
+    if claims.get('role') != 'admin':
+        return jsonify({'error': 'Forbidden'}), 403
+    u = User.query.get(uid)
+    if not u:
+        return jsonify({'error': 'Not found'}), 404
+    data = request.json or {}
+    if 'email' in data and data['email']:
+        new_email = data['email'].strip().lower()
+        if new_email != u.email and User.query.filter_by(email=new_email).first():
+            return jsonify({'error': 'email already exists'}), 400
+        u.email = new_email
+    if 'name' in data:
+        u.name = data['name']
+    if 'role' in data:
+        u.role = data['role']
+    if 'password' in data and data['password']:
+        u.set_password(data['password'])
+    db.session.commit()
+    return jsonify({'id': u.id, 'email': u.email, 'name': u.name, 'role': u.role})
 
 # Arrivals
 @app.route('/api/arrivals', methods=['GET'])
@@ -592,6 +687,48 @@ def upload_file(arrival_id):
     db.session.add(rec); db.session.commit()
     return jsonify({'id': rec.id, 'arrival_id': rec.arrival_id, 'filename': rec.filename, 'original_name': rec.original_name, 'uploaded_at': rec.uploaded_at.isoformat()}), 201
 
+# List files for an arrival
+@app.route('/api/arrivals/<int:arrival_id>/files', methods=['GET'])
+@jwt_required(optional=True)
+def list_files(arrival_id):
+    Arrival.query.get_or_404(arrival_id)
+    files = ArrivalFile.query.filter_by(arrival_id=arrival_id).order_by(ArrivalFile.uploaded_at.asc()).all()
+    return jsonify([
+        {
+            'id': f.id,
+            'arrival_id': f.arrival_id,
+            'filename': f.filename,
+            'original_name': f.original_name,
+            'uploaded_at': f.uploaded_at.isoformat(),
+            'url': f"/files/{f.filename}",
+        } for f in files
+    ])
+
+# Delete a file (admin or API key)
+@app.route('/api/arrivals/<int:arrival_id>/files/<int:file_id>', methods=['DELETE'])
+@jwt_required(optional=True)
+def delete_file(arrival_id, file_id):
+    # Admin via JWT or system via API key
+    if not (has_valid_api_key()):
+        try:
+            verify_jwt_in_request(optional=False)
+        except Exception:
+            return jsonify({'error': 'Unauthorized'}), 401
+        claims = get_jwt()
+        if (claims or {}).get('role') != 'admin':
+            return jsonify({'error': 'Admin only'}), 403
+    rec = ArrivalFile.query.filter_by(id=file_id, arrival_id=arrival_id).first()
+    if not rec:
+        return jsonify({'error': 'Not found'}), 404
+    # Try delete file from disk
+    try:
+        os.remove(os.path.join(app.config['UPLOAD_FOLDER'], rec.filename))
+    except Exception:
+        pass
+    db.session.delete(rec)
+    db.session.commit()
+    return jsonify({'ok': True, 'deleted_id': file_id})
+
 @app.route('/files/<path:filename>', methods=['GET'])
 def get_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
@@ -700,4 +837,5 @@ with app.app_context():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    app.run(host='0.0.0.0', port=port, debug=debug)
