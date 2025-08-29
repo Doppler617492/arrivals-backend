@@ -6,7 +6,7 @@ from flask_jwt_extended import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import relationship
 from sqlalchemy import or_, text
 from functools import wraps
@@ -16,6 +16,8 @@ import threading
 import smtplib
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
+
+from mailer import maybe_notify_paid
 
 load_dotenv()
 
@@ -37,14 +39,29 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', '16')) * 1024 * 1024
 
 # Mail / SLA
-SMTP_HOST = os.environ.get('SMTP_HOST')
+# Sensible defaults for Gmail (App Password required):
+SMTP_HOST = (os.environ.get('SMTP_HOST') or 'smtp.gmail.com').strip()
 SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
-SMTP_USER = os.environ.get('SMTP_USER')
-SMTP_PASS = os.environ.get('SMTP_PASS')
-MAIL_FROM = os.environ.get('MAIL_FROM', os.environ.get('ADMIN_EMAIL', 'noreply@example.com'))
+SMTP_USER = (os.environ.get('SMTP_USER') or '').strip()
+SMTP_PASS = (os.environ.get('SMTP_PASS') or '').strip()
+
+# From must match authenticated user for Gmail; fall back to SMTP_USER
+MAIL_FROM = (os.environ.get('MAIL_FROM') or SMTP_USER or os.environ.get('ADMIN_EMAIL') or 'noreply@example.com').strip()
+
+# Recipients: env MAIL_DEFAULT_TO (comma separated) or ADMIN_EMAIL
 MAIL_DEFAULT_TO = [e.strip() for e in (os.environ.get('MAIL_DEFAULT_TO') or os.environ.get('ADMIN_EMAIL','')).split(',') if e.strip()]
+# Always include it@cungu.com during development (remove for prod if undesired)
+if 'it@cungu.com' not in MAIL_DEFAULT_TO:
+    MAIL_DEFAULT_TO.append('it@cungu.com')
+
+# Mail flags
+SMTP_TLS = (os.environ.get('SMTP_TLS', 'true').lower() in ('1','true','yes','on'))
+SMTP_SSL = (os.environ.get('SMTP_SSL', 'false').lower() in ('1','true','yes','on'))
+MAIL_DEBUG = (os.environ.get('MAIL_DEBUG', 'false').lower() in ('1','true','yes','on'))
+
 NOTIFY_ON_STATUS = os.environ.get('NOTIFY_ON_STATUS', 'true').lower() == 'true'
 NOTIFY_ON_SLA = os.environ.get('NOTIFY_ON_SLA', 'true').lower() == 'true'
+NOTIFY_ON_PAID = os.environ.get('NOTIFY_ON_PAID', 'true').lower() == 'true'
 SLA_CHECK_SECONDS = int(os.environ.get('SLA_CHECK_SECONDS', '3600'))
 
 jwt = JWTManager(app)
@@ -111,9 +128,18 @@ class ArrivalUpdate(db.Model):
     message = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+
 class ArrivalFile(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     arrival_id = db.Column(db.Integer, db.ForeignKey('arrival.id'), nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
+    original_name = db.Column(db.String(255), nullable=False)
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+# --- ContainerFile model ---
+class ContainerFile(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    container_id = db.Column(db.Integer, db.ForeignKey('containers.id'), nullable=False)
     filename = db.Column(db.String(255), nullable=False)
     original_name = db.Column(db.String(255), nullable=False)
     uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -123,6 +149,8 @@ class Arrival(db.Model):
     supplier = db.Column(db.String(120), nullable=False)
     carrier = db.Column(db.String(120))
     plate = db.Column(db.String(32))
+    driver = db.Column(db.String(120))            # name of the driver (Šofer)
+    pickup_date = db.Column(db.DateTime)          # datum za podizanje robe
     type = db.Column(db.String(32), default="truck")
     eta = db.Column(db.String(32))
     status = db.Column(db.String(32), default="announced")
@@ -138,6 +166,7 @@ class Arrival(db.Model):
     # Finansije / carina
     customs_info = db.Column(db.Text)
     freight_cost = db.Column(db.Float)
+    goods_cost = db.Column(db.Float)              # cijena robe
     customs_cost = db.Column(db.Float)
     currency = db.Column(db.String(8), default='EUR')
 
@@ -172,6 +201,8 @@ class Arrival(db.Model):
             'supplier': self.supplier,
             'carrier': self.carrier,
             'plate': self.plate,
+            'driver': self.driver,
+            'pickup_date': self.pickup_date.isoformat() if self.pickup_date else None,
             'type': self.type,
             'eta': self.eta,
             'status': self.status,
@@ -183,6 +214,7 @@ class Arrival(db.Model):
             'arrived_at': self.arrived_at.isoformat() if self.arrived_at else None,
             'customs_info': self.customs_info,
             'freight_cost': self.freight_cost,
+            'goods_cost': self.goods_cost,
             'customs_cost': self.customs_cost,
             'currency': self.currency,
             'assignee_id': self.assignee_id,
@@ -191,21 +223,71 @@ class Arrival(db.Model):
             'overdue': overdue,
         }
 
+# --- Container model ---
+class Container(db.Model):
+    __tablename__ = "containers"
+    id = db.Column(db.Integer, primary_key=True)
+
+    supplier = db.Column(db.String(255), default="")
+    proforma_no = db.Column(db.String(255), default="")
+
+    etd = db.Column(db.Date, nullable=True)
+    delivery = db.Column(db.Date, nullable=True)
+    eta = db.Column(db.Date, nullable=True)
+
+    cargo_qty = db.Column(db.String(64), default="")
+    cargo = db.Column(db.String(255), default="")
+    container_no = db.Column(db.String(128), default="")
+    roba = db.Column(db.String(255), default="")
+    contain_price = db.Column(db.String(64), default="")
+    agent = db.Column(db.String(128), default="")
+
+    total = db.Column(db.String(64), default="")
+    deposit = db.Column(db.String(64), default="")
+    balance = db.Column(db.String(64), default="")
+    paid = db.Column(db.Boolean, default=False)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    files = relationship('ContainerFile', backref='container', cascade='all, delete-orphan')
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "supplier": self.supplier or "",
+            "proformaNo": self.proforma_no or "",
+            "etd": self.etd.isoformat() if self.etd else "",
+            "delivery": self.delivery.isoformat() if self.delivery else "",
+            "eta": self.eta.isoformat() if self.eta else "",
+            "cargoQty": self.cargo_qty or "",
+            "cargo": self.cargo or "",
+            "containerNo": self.container_no or "",
+            "roba": self.roba or "",
+            "containPrice": self.contain_price or "",
+            "agent": self.agent or "",
+            "total": self.total or "",
+            "deposit": self.deposit or "",
+            "balance": self.balance or "",
+            "placeno": bool(self.paid),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
 # --- Role permissions ---
 ROLE_FIELDS = {
     'admin': {'supplier','carrier','plate','type','eta','status','note','order_date','production_due',
-              'shipped_at','arrived_at','customs_info','freight_cost','customs_cost','currency','assignee_id'},
+              'shipped_at','arrived_at','customs_info','freight_cost','customs_cost','currency','assignee_id',
+              'driver','pickup_date','goods_cost'},
     'planer': {'supplier','order_date','production_due','status','note'},
     'proizvodnja': {'status','note'},
-    'transport': {'carrier','plate','eta','status','shipped_at','note'},
+    'transport': {'carrier','plate','eta','status','shipped_at','note','driver','pickup_date','freight_cost'},
     'carina': {'status','customs_info','customs_cost','note'},
     'viewer': set(),
 }
 
 ALLOWED_STATUSES = {
-    'announced','ordered','in_production','ready_for_pickup',
-    'picked_up','shipped','at_customs','cleared_customs',
-    'arriving','arrived','warehoused','delayed','cancelled'
+    'not_shipped','shipped','arrived'
 }
 
 def can_edit(role: str, fields: set) -> bool:
@@ -250,8 +332,10 @@ def check_api_or_jwt(attempted_fields: set):
     uid = get_jwt_identity()
     role = (claims or {}).get('role', 'viewer')
 
-    # If no JWT at all, unauthorized
+    # If no JWT at all, allow anonymous writes in DEV if ALLOW_ANON_WRITE=1 (or true/yes/on)
     if uid is None and not claims:
+        if os.environ.get('ALLOW_ANON_WRITE', '').lower() in ('1', 'true', 'yes', 'on'):
+            return True, 'system', None, None
         return False, None, None, (jsonify({'error': 'Unauthorized'}), 401)
 
     # Admin can edit anything
@@ -265,25 +349,65 @@ def check_api_or_jwt(attempted_fields: set):
     return True, role, int(uid) if uid else None, None
 
 def send_email(subject: str, body: str, to_list=None):
-    to_list = to_list or MAIL_DEFAULT_TO
+    """
+    Sends an email via SMTP.
+    Supports:
+      - STARTTLS (default, e.g. smtp.gmail.com:587 with app password)
+      - SMTPS/SSL (e.g. port 465) if SMTP_SSL=true or SMTP_PORT==465
+    Set MAIL_DEBUG=1 to enable SMTP debug prints.
+    """
+    to_list = (to_list or MAIL_DEFAULT_TO) or []
     if not to_list:
-        print(f"[MAIL-DEV] {subject}\n{body}\n(no recipients configured)")
+        print(f"[MAIL-DEV] {subject}\n(no recipients configured)\n{body}")
         return
+
+    # Development shortcut: if SMTP_HOST missing, just log
     if not SMTP_HOST:
         print(f"[MAIL-DEV] {subject}\nTo: {', '.join(to_list)}\n{body}")
         return
+
     try:
         msg = MIMEText(body, 'plain', 'utf-8')
         msg['Subject'] = subject
-        msg['From'] = MAIL_FROM
+
+        # For Gmail, the envelope-from and header From should be the authenticated user
+        from_addr = MAIL_FROM or SMTP_USER or 'noreply@example.com'
+        if 'gmail' in (SMTP_HOST or '').lower() and SMTP_USER:
+            from_addr = SMTP_USER
+        msg['From'] = from_addr
         msg['To'] = ', '.join(to_list)
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
-            s.starttls()
+        if MAIL_FROM and MAIL_FROM != from_addr:
+            msg['Reply-To'] = MAIL_FROM
+
+        use_ssl = SMTP_SSL or str(SMTP_PORT) == '465'
+        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) if use_ssl else smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
+        if MAIL_DEBUG:
+            server.set_debuglevel(1)
+        try:
+            if not use_ssl and SMTP_TLS:
+                server.starttls()
             if SMTP_USER:
-                s.login(SMTP_USER, SMTP_PASS or '')
-            s.sendmail(MAIL_FROM, to_list, msg.as_string())
+                server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(from_addr, to_list, msg.as_string())
+            print(f"[MAIL-SENT] subject='{subject}' from='{from_addr}' to={to_list}")
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
+
+    except smtplib.SMTPAuthenticationError as e:
+        print("[MAIL-ERROR] AUTH failed – check SMTP_USER / SMTP_PASS (use App Password for Gmail).", e)
+        raise
+    except smtplib.SMTPSenderRefused as e:
+        print("[MAIL-ERROR] SENDER refused – check MAIL_FROM / SMTP_USER alignment.", e)
+        raise
+    except smtplib.SMTPRecipientsRefused as e:
+        print("[MAIL-ERROR] RECIPIENTS refused – check 'to' addresses.", e)
+        raise
     except Exception as e:
         print("[MAIL-ERROR]", e)
+        raise
 
 def all_user_emails():
     emails = [u.email for u in User.query.all() if u.email]
@@ -292,7 +416,8 @@ def all_user_emails():
 # --- Routes ---
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({"ok": True, "routes": ["/api/arrivals","/auth/login"]})
+    return jsonify({"ok": True, "routes": ["/api/arrivals","/api/containers","/auth/login"]})
+
 
 # --- Auth ---
 @app.route('/auth/login', methods=['POST'])
@@ -429,10 +554,13 @@ def get_arrival(id):
 def search_arrivals():
     try:
         page = int(request.args.get('page', 1))
-        page_size = int(request.args.get('page_size', 20))
-        page = max(1, page); page_size = min(max(1, page_size), 100)
+        # accept both per_page and page_size (frontend sends per_page)
+        per_page_raw = request.args.get('per_page', request.args.get('page_size', 20))
+        per_page = int(per_page_raw)
+        page = max(1, page)
+        per_page = min(max(1, per_page), 100)
     except ValueError:
-        return jsonify({'error': 'page/page_size must be integers'}), 400
+        return jsonify({'error': 'page/per_page must be integers'}), 400
 
     status = request.args.get('status')
     supplier = request.args.get('supplier')
@@ -446,25 +574,36 @@ def search_arrivals():
     sort_col = sort_field_map.get(sort, Arrival.created_at)
     sort_expr = sort_col.desc() if order != 'asc' else sort_col.asc()
     query = Arrival.query
-    if status: query = query.filter(Arrival.status == status)
-    if supplier: query = query.filter(Arrival.supplier.ilike(f"%{supplier}%"))
+    if status:
+        query = query.filter(Arrival.status == status)
+    if supplier:
+        query = query.filter(Arrival.supplier.ilike(f"%{supplier}%"))
     if q:
         like = f"%{q}%"
         query = query.filter(or_(Arrival.plate.ilike(like), Arrival.carrier.ilike(like)))
 
     def parse_dt(val):
-        if not val: return None
-        try: return datetime.fromisoformat(val)
-        except Exception: return None
-    from_dt = parse_dt(from_str); to_dt = parse_dt(to_str)
-    if from_str and not from_dt: return jsonify({'error': "Invalid 'from' ISO datetime"}), 400
-    if to_str and not to_dt: return jsonify({'error': "Invalid 'to' ISO datetime"}), 400
-    if from_dt: query = query.filter(Arrival.created_at >= from_dt)
-    if to_dt: query = query.filter(Arrival.created_at <= to_dt)
+        if not val:
+            return None
+        try:
+            return datetime.fromisoformat(val)
+        except Exception:
+            return None
+
+    from_dt = parse_dt(from_str)
+    to_dt = parse_dt(to_str)
+    if from_str and not from_dt:
+        return jsonify({'error': "Invalid 'from' ISO datetime"}), 400
+    if to_str and not to_dt:
+        return jsonify({'error': "Invalid 'to' ISO datetime"}), 400
+    if from_dt:
+        query = query.filter(Arrival.created_at >= from_dt)
+    if to_dt:
+        query = query.filter(Arrival.created_at <= to_dt)
 
     total = query.count()
-    items = query.order_by(sort_expr).offset((page-1)*page_size).limit(page_size).all()
-    return jsonify({'page': page, 'page_size': page_size, 'total': total, 'items': [a.to_dict() for a in items]})
+    items = query.order_by(sort_expr).offset((page - 1) * per_page).limit(per_page).all()
+    return jsonify({'page': page, 'per_page': per_page, 'total': total, 'items': [a.to_dict() for a in items]})
 
 @app.route('/api/arrivals', methods=['POST'])
 def create_arrival():
@@ -477,9 +616,11 @@ def create_arrival():
         supplier=data.get('supplier'),
         carrier=data.get('carrier'),
         plate=data.get('plate'),
+        driver=data.get('driver'),
+        pickup_date=_parse_iso(data.get('pickup_date')),
         type=data.get('type','truck'),
         eta=data.get('eta'),
-        status=data.get('status','announced'),
+        status=data.get('status','not_shipped'),
         note=data.get('note'),
         order_date=_parse_iso(data.get('order_date')),
         production_due=_parse_iso(data.get('production_due')),
@@ -487,6 +628,7 @@ def create_arrival():
         arrived_at=_parse_iso(data.get('arrived_at')),
         customs_info=data.get('customs_info'),
         freight_cost=_parse_float(data.get('freight_cost')),
+        goods_cost=_parse_float(data.get('goods_cost')),
         customs_cost=_parse_float(data.get('customs_cost')),
         currency=(data.get('currency') or 'EUR')[:8],
         assignee_id=data.get('assignee_id')
@@ -511,7 +653,7 @@ def update_arrival(id):
             return True
         return field in (editable or set())
 
-    for field in ['supplier','carrier','plate','type','eta','status','note','customs_info','currency','assignee_id']:
+    for field in ['supplier','carrier','plate','driver','type','eta','status','note','customs_info','currency','assignee_id']:
         if field in data and can_set(field):
             setattr(a, field, data[field])
     if 'order_date' in data and can_set('order_date'): a.order_date = _parse_iso(data.get('order_date'))
@@ -520,6 +662,8 @@ def update_arrival(id):
     if 'arrived_at' in data and can_set('arrived_at'): a.arrived_at = _parse_iso(data.get('arrived_at'))
     if 'freight_cost' in data and can_set('freight_cost'): a.freight_cost = _parse_float(data.get('freight_cost'))
     if 'customs_cost' in data and can_set('customs_cost'): a.customs_cost = _parse_float(data.get('customs_cost'))
+    if 'pickup_date' in data and can_set('pickup_date'): a.pickup_date = _parse_iso(data.get('pickup_date'))
+    if 'goods_cost' in data and can_set('goods_cost'): a.goods_cost = _parse_float(data.get('goods_cost'))
     db.session.commit()
     return jsonify(a.to_dict())
 
@@ -676,16 +820,38 @@ def create_update(arrival_id):
 @jwt_required()
 def upload_file(arrival_id):
     Arrival.query.get_or_404(arrival_id)
-    if 'file' not in request.files: return jsonify({'error': 'file missing'}), 400
-    f = request.files['file']
-    if f.filename == '': return jsonify({'error': 'empty filename'}), 400
-    safe_name = secure_filename(f.filename)
-    unique_name = f"{int(time.time()*1000)}_{safe_name}"
-    path = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
-    f.save(path)
-    rec = ArrivalFile(arrival_id=arrival_id, filename=unique_name, original_name=safe_name)
-    db.session.add(rec); db.session.commit()
-    return jsonify({'id': rec.id, 'arrival_id': rec.arrival_id, 'filename': rec.filename, 'original_name': rec.original_name, 'uploaded_at': rec.uploaded_at.isoformat()}), 201
+
+    # Collect files from both 'files' (multiple) and 'file' (single)
+    files = []
+    if 'files' in request.files:
+        files.extend(request.files.getlist('files'))
+    if 'file' in request.files:
+        files.append(request.files['file'])
+
+    if not files:
+        return jsonify({'error': 'file/files missing'}), 400
+
+    recs = []
+    for f in files:
+        if not f or f.filename == '':
+            continue
+        safe_name = secure_filename(f.filename)
+        unique_name = f"{int(time.time()*1000)}_{safe_name}"
+        path = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
+        f.save(path)
+        rec = ArrivalFile(arrival_id=arrival_id, filename=unique_name, original_name=safe_name)
+        db.session.add(rec)
+        db.session.flush()  # get IDs without full commit
+        recs.append({
+            'id': rec.id,
+            'arrival_id': rec.arrival_id,
+            'filename': rec.filename,
+            'original_name': rec.original_name,
+            'uploaded_at': (rec.uploaded_at or datetime.utcnow()).isoformat(),
+            'url': f"/files/{rec.filename}",
+        })
+    db.session.commit()
+    return jsonify(recs), 201
 
 # List files for an arrival
 @app.route('/api/arrivals/<int:arrival_id>/files', methods=['GET'])
@@ -703,6 +869,7 @@ def list_files(arrival_id):
             'url': f"/files/{f.filename}",
         } for f in files
     ])
+
 
 # Delete a file (admin or API key)
 @app.route('/api/arrivals/<int:arrival_id>/files/<int:file_id>', methods=['DELETE'])
@@ -729,9 +896,236 @@ def delete_file(arrival_id, file_id):
     db.session.commit()
     return jsonify({'ok': True, 'deleted_id': file_id})
 
+# Container Files
+@app.route('/api/containers/<int:cid>/files', methods=['POST'])
+@jwt_required()
+def upload_container_file(cid):
+    # Ensure container exists
+    Container.query.get_or_404(cid)
+
+    # Collect files from both 'files' (multiple) and 'file' (single)
+    files = []
+    if 'files' in request.files:
+        files.extend(request.files.getlist('files'))
+    if 'file' in request.files:
+        files.append(request.files['file'])
+
+    if not files:
+        return jsonify({'error': 'file/files missing'}), 400
+
+    recs = []
+    for f in files:
+        if not f or f.filename == '':
+            continue
+        safe_name = secure_filename(f.filename)
+        unique_name = f"{int(time.time()*1000)}_{safe_name}"
+        path = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
+        f.save(path)
+        rec = ContainerFile(container_id=cid, filename=unique_name, original_name=safe_name)
+        db.session.add(rec)
+        db.session.flush()
+        recs.append({
+            'id': rec.id,
+            'container_id': rec.container_id,
+            'filename': rec.filename,
+            'original_name': rec.original_name,
+            'uploaded_at': (rec.uploaded_at or datetime.utcnow()).isoformat(),
+            'url': f"/files/{rec.filename}",
+        })
+    db.session.commit()
+    return jsonify(recs), 201
+
+@app.route('/api/containers/<int:cid>/files', methods=['GET'])
+@jwt_required(optional=True)
+def list_container_files(cid):
+    Container.query.get_or_404(cid)
+    files = ContainerFile.query.filter_by(container_id=cid).order_by(ContainerFile.uploaded_at.asc()).all()
+    return jsonify([
+        {
+            'id': f.id,
+            'container_id': f.container_id,
+            'filename': f.filename,
+            'original_name': f.original_name,
+            'uploaded_at': f.uploaded_at.isoformat(),
+            'url': f"/files/{f.filename}",
+        } for f in files
+    ])
+
+@app.route('/api/containers/<int:cid>/files/<int:file_id>', methods=['DELETE'])
+@jwt_required(optional=True)
+def delete_container_file(cid, file_id):
+    # Admin via JWT or system via API key
+    if not (has_valid_api_key()):
+        try:
+            verify_jwt_in_request(optional=False)
+        except Exception:
+            return jsonify({'error': 'Unauthorized'}), 401
+        claims = get_jwt()
+        if (claims or {}).get('role') != 'admin':
+            return jsonify({'error': 'Admin only'}), 403
+
+    rec = ContainerFile.query.filter_by(id=file_id, container_id=cid).first()
+    if not rec:
+        return jsonify({'error': 'Not found'}), 404
+
+    # Try delete file from disk
+    try:
+        os.remove(os.path.join(app.config['UPLOAD_FOLDER'], rec.filename))
+    except Exception:
+        pass
+
+    db.session.delete(rec)
+    db.session.commit()
+    return jsonify({'ok': True, 'deleted_id': file_id})
+
 @app.route('/files/<path:filename>', methods=['GET'])
 def get_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
+
+# Containers CRUD + search
+@app.get('/api/containers')
+@jwt_required(optional=True)
+def containers_list():
+    q = (request.args.get('q') or '').strip().lower()
+    status = (request.args.get('status') or 'all').lower()  # all | paid | unpaid
+
+    query = Container.query
+    if q:
+        like = f"%{q}%"
+        query = query.filter(or_(
+            Container.supplier.ilike(like),
+            Container.proforma_no.ilike(like),
+            Container.cargo.ilike(like),
+            Container.container_no.ilike(like),
+            Container.roba.ilike(like),
+            Container.agent.ilike(like),
+        ))
+
+    if status == 'paid':
+        query = query.filter(Container.paid.is_(True))
+    elif status == 'unpaid':
+        query = query.filter(Container.paid.is_(False))
+
+    rows = query.order_by(Container.created_at.desc()).all()
+    return jsonify([r.to_dict() for r in rows])
+
+
+@app.post('/api/containers')
+@jwt_required()
+def containers_create():
+    data = request.get_json(force=True) or {}
+    r = Container(
+        supplier=data.get('supplier', ''),
+        proforma_no=data.get('proformaNo', ''),
+        etd=_parse_date_any(data.get('etd')),
+        delivery=_parse_date_any(data.get('delivery')),
+        eta=_parse_date_any(data.get('eta')),
+        cargo_qty=data.get('cargoQty', ''),
+        cargo=data.get('cargo', ''),
+        container_no=data.get('containerNo', ''),
+        roba=data.get('roba', ''),
+        contain_price=data.get('containPrice', ''),
+        agent=data.get('agent', ''),
+        total=data.get('total', ''),
+        deposit=data.get('deposit', ''),
+        balance=data.get('balance', ''),
+        paid=bool(data.get('placeno', False)),
+    )
+
+    # server-side BALANCE recompute (no auto-paid)
+    T = _money_to_number(r.total)
+    D = _money_to_number(r.deposit)
+    if T is not None and D is not None:
+        bal = round(T - D, 2)
+        r.balance = f"{bal:.2f}"
+    # NOTE: do NOT auto-set r.paid based on balance; user controls "placeno" manually.
+
+    db.session.add(r)
+    db.session.commit()
+
+    # notify if newly created row is paid (e.g., total == deposit or manual)
+    try:
+        if NOTIFY_ON_PAID:
+            new_row = r.to_dict()
+            # Simulate previous state as unpaid to trigger transition
+            old_row = dict(new_row)
+            old_row["placeno"] = False
+            maybe_notify_paid(old_row, new_row, recipients=(MAIL_DEFAULT_TO or all_user_emails()))
+    except Exception as _notify_err:
+        print("[MAIL notify_paid (create) ERROR]", _notify_err)
+
+    return jsonify(r.to_dict()), 201
+
+
+@app.patch('/api/containers/<int:cid>')
+@jwt_required()
+def containers_update(cid):
+    r = Container.query.get_or_404(cid)
+    data = request.get_json(force=True) or {}
+    # snapshot prije izmjena (za detekciju prelaza neplaćeno -> plaćeno)
+    try:
+        old_row = r.to_dict()
+    except Exception:
+        old_row = None
+
+    # basic fields
+    mapping = {
+        "supplier": "supplier",
+        "proformaNo": "proforma_no",
+        "cargoQty": "cargo_qty",
+        "cargo": "cargo",
+        "containerNo": "container_no",
+        "roba": "roba",
+        "containPrice": "contain_price",
+        "agent": "agent",
+        "total": "total",
+        "deposit": "deposit",
+        "balance": "balance",
+    }
+    for k, attr in mapping.items():
+        if k in data:
+            setattr(r, attr, data.get(k) or "")
+
+    # dates
+    if "etd" in data:
+        r.etd = _parse_date_any(data.get("etd"))
+    if "delivery" in data:
+        r.delivery = _parse_date_any(data.get("delivery"))
+    if "eta" in data:
+        r.eta = _parse_date_any(data.get("eta"))
+
+    # manual paid toggle (kept)
+    if "placeno" in data:
+        r.paid = bool(data.get("placeno"))
+
+    # server-side recompute balance (no auto-paid)
+    T = _money_to_number(r.total)
+    D = _money_to_number(r.deposit)
+    if T is not None and D is not None:
+        bal = round(T - D, 2)
+        r.balance = f"{bal:.2f}"
+    # NOTE: do NOT auto-set r.paid based on balance; user controls "placeno" manually.
+
+    db.session.commit()
+    # nakon upisa – provjeri da li je došlo do prelaza na plaćeno i pošalji mail
+    if NOTIFY_ON_PAID:
+        try:
+            new_row = r.to_dict()
+            if old_row is not None:
+                maybe_notify_paid(old_row, new_row, recipients=(MAIL_DEFAULT_TO or all_user_emails()))
+        except Exception as _notify_err:
+            # ne ruši request ako mail ne prođe
+            print("[MAIL notify_paid (update) ERROR]", _notify_err)
+    return jsonify(r.to_dict())
+
+
+@app.delete('/api/containers/<int:cid>')
+@jwt_required()
+def containers_delete(cid):
+    r = Container.query.get_or_404(cid)
+    db.session.delete(r)
+    db.session.commit()
+    return jsonify({"ok": True, "deleted_id": cid})
 
 # KPI
 @app.route('/api/kpi', methods=['GET'])
@@ -744,16 +1138,99 @@ def kpi():
 
 # --- Utility parsers ---
 def _parse_iso(val):
-    if not val: return None
+    if not val:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
     try:
-        return datetime.fromisoformat(val.replace('Z','+00:00'))
+        # Standard ISO: '2025-03-11' or '2025-03-11T12:34:56Z'
+        return datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except Exception:
+        pass
+    # Accept European formats: 'dd.mm.yyyy' and 'dd.mm.yyyy HH:MM'
+    for fmt in ("%d.%m.%Y", "%d.%m.%Y %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    # Accept common fallback: 'dd/mm/yyyy'
+    for fmt in ("%d/%m/%Y", "%d/%m/%Y %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
+
+def _parse_float(val):
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    # Remove currency symbols and spaces
+    for ch in ['€', '$', ' ', '\u00A0']:
+        s = s.replace(ch, '')
+    # If the string has both '.' and ',', assume '.' is thousands sep and ',' is decimal
+    if ',' in s and '.' in s:
+        s = s.replace('.', '').replace(',', '.')
+    else:
+        # Otherwise, just turn comma into decimal point
+        s = s.replace(',', '.')
+    try:
+        return float(s)
     except Exception:
         return None
 
-def _parse_float(val):
-    if val is None: return None
-    try: return float(val)
-    except Exception: return None
+def _parse_date_any(val):
+    """
+    Robust date parser for 'YYYY-MM-DD', ISO strings, and Excel serial numbers.
+    Returns datetime.date or None.
+    """
+    if not val:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    # Already ISO date 'YYYY-MM-DD'
+    try:
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            return datetime.fromisoformat(s).date()
+    except Exception:
+        pass
+    # Excel serial number?
+    try:
+        n = float(s)
+        if n > 10000:  # crude guard for serials
+            base = datetime(1899, 12, 30)
+            dt = base + timedelta(days=n)
+            return dt.date()
+    except Exception:
+        pass
+    # Fallback parse
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt.date()
+    except Exception:
+        pass
+    for fmt in ("%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    return None
+
+def _money_to_number(val):
+    if val is None:
+        return None
+    s = str(val)
+    s = "".join(ch for ch in s if ch.isdigit() or ch in ",.-")
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 # --- Admin seed ---
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL')
@@ -789,6 +1266,9 @@ def soft_migrate():
         'currency': "VARCHAR(8) DEFAULT 'EUR'",
         'assignee_id': 'INTEGER',
         'production_overdue_notified': 'BOOLEAN DEFAULT 0',
+        'driver': 'VARCHAR(120)',
+        'pickup_date': 'DATETIME',
+        'goods_cost': 'FLOAT',
     }
     for c, t in cols.items():
         if not column_exists('arrival', c):
@@ -803,25 +1283,26 @@ def sla_monitor_loop():
     # Simple loop – production overdue alerts
     while True:
         try:
-            now = datetime.utcnow()
-            pending = Arrival.query.filter(
-                Arrival.production_due.isnot(None),
-                Arrival.production_due < now,
-                Arrival.status.in_(['ordered','in_production']),
-                (Arrival.production_overdue_notified.is_(False))
-            ).all()
-            if pending and NOTIFY_ON_SLA:
-                for a in pending:
-                    try:
-                        send_email(
-                            subject=f"[Arrivals] PRODUCTION OVERDUE for #{a.id}",
-                            body=f"Supplier: {a.supplier}\nDue: {a.production_due}\nStatus: {a.status}\nPlease contact manufacturer."
-                            , to_list=all_user_emails()
-                        )
-                        a.production_overdue_notified = True
-                    except Exception as e:
-                        print("[SLA MAIL ERROR]", e)
-                db.session.commit()
+            with app.app_context():
+                now = datetime.utcnow()
+                pending = Arrival.query.filter(
+                    Arrival.production_due.isnot(None),
+                    Arrival.production_due < now,
+                    Arrival.status.in_(['ordered','in_production']),
+                    (Arrival.production_overdue_notified.is_(False))
+                ).all()
+                if pending and NOTIFY_ON_SLA:
+                    for a in pending:
+                        try:
+                            send_email(
+                                subject=f"[Arrivals] PRODUCTION OVERDUE for #{a.id}",
+                                body=f"Supplier: {a.supplier}\nDue: {a.production_due}\nStatus: {a.status}\nPlease contact manufacturer.",
+                                to_list=all_user_emails()
+                            )
+                            a.production_overdue_notified = True
+                        except Exception as e:
+                            print("[SLA MAIL ERROR]", e)
+                    db.session.commit()
         except Exception as e:
             print("[SLA LOOP ERROR]", e)
         time.sleep(SLA_CHECK_SECONDS)
