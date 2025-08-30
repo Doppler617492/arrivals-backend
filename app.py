@@ -22,7 +22,32 @@ from mailer import maybe_notify_paid
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True, methods=['GET','POST','PATCH','DELETE','OPTIONS'])
+
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "*"]},
+               r"/auth/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "*"]},
+               r"/files/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "*"]},
+               r"/": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "*"]}},
+    supports_credentials=False,
+    methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"]
+)
+
+# Catch-all OPTIONS handler for CORS preflight requests
+@app.route('/<path:_any>', methods=['OPTIONS'])
+def _cors_preflight(_any):
+    # Generic 204 for all preflight requests
+    return ("", 204)
+
+# After-request hook to set CORS headers if missing
+@app.after_request
+def _add_cors_fallback(resp):
+    # Fallback headers in case any response slips past Flask-CORS
+    resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+    return resp
 
 # --- Config ---
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///arrivals.db')
@@ -1317,6 +1342,6 @@ with app.app_context():
     t.start()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 8081))
     debug = os.environ.get('FLASK_DEBUG', '0') == '1'
     app.run(host='0.0.0.0', port=port, debug=debug)
