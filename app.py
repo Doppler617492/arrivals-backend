@@ -459,6 +459,22 @@ def auth_login():
     token = create_access_token(identity=identity, additional_claims=claims)
     return jsonify({'access_token': token, 'user': {'id': user.id, 'email': user.email, 'name': user.name, 'role': user.role}})
 
+# --- Legacy compatibility routes (old frontend paths) ---
+# Some older clients may POST to /login instead of /auth/login.
+# This forwards those requests to the same handler to avoid 405 errors.
+@app.route('/login', methods=['POST', 'OPTIONS'])
+def legacy_login():
+    if request.method == 'OPTIONS':
+        # Preflight handled here explicitly, though global handler also covers it
+        return ("", 204)
+    return auth_login()
+
+# Some older clients may call GET /me; forward to /auth/me
+@app.route('/me', methods=['GET'])
+@jwt_required()
+def legacy_me():
+    return auth_me()
+
 # Refresh endpoint for JWT
 @app.route('/auth/refresh', methods=['POST'])
 @jwt_required()
