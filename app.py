@@ -30,7 +30,7 @@ CORS(
                r"/files/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "*"]},
                r"/": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "*"]}},
     supports_credentials=False,
-    methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"]
 )
 
@@ -46,7 +46,7 @@ def _add_cors_fallback(resp):
     # Fallback headers in case any response slips past Flask-CORS
     resp.headers.setdefault("Access-Control-Allow-Origin", "*")
     resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
-    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS, HEAD")
     return resp
 
 # --- Config ---
@@ -442,6 +442,13 @@ def all_user_emails():
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"ok": True, "routes": ["/api/arrivals","/api/containers","/auth/login"]})
+
+# Simple health endpoint for CLI checks and uptime probes
+@app.route('/health', methods=['GET', 'HEAD', 'OPTIONS'])
+def health_route():
+    if request.method == 'OPTIONS':
+        return ("", 204)
+    return jsonify({"ok": True})
 
 
 # --- Auth ---
@@ -1070,16 +1077,25 @@ def containers_create():
         total=data.get('total', ''),
         deposit=data.get('deposit', ''),
         balance=data.get('balance', ''),
-        paid=bool(data.get('placeno', False)),
+        paid=bool(data.get('placeno', False) if _parse_boolish(data.get('placeno', False)) is not None else _parse_boolish(
+            data.get('paid')
+            or data.get('is_paid')
+            or data.get('payment_status')
+            or data.get('status')
+        ) or False),
     )
 
-    # server-side BALANCE recompute (no auto-paid)
+    # server-side BALANCE recompute
     T = _money_to_number(r.total)
     D = _money_to_number(r.deposit)
-    if T is not None and D is not None:
+    paid_flag = bool(r.paid)
+    if paid_flag:
+        # If paid on creation, force balance to 0.00
+        r.balance = "0.00"
+    elif T is not None and D is not None:
         bal = round(T - D, 2)
         r.balance = f"{bal:.2f}"
-    # NOTE: do NOT auto-set r.paid based on balance; user controls "placeno" manually.
+    # NOTE: do NOT auto-set r.paid based purely on balance; user controls it via 'placeno/paid'.
 
     db.session.add(r)
     db.session.commit()
@@ -1135,17 +1151,30 @@ def containers_update(cid):
     if "eta" in data:
         r.eta = _parse_date_any(data.get("eta"))
 
-    # manual paid toggle (kept)
+    # manual paid toggle (alias-aware)
+    paid_in = None
     if "placeno" in data:
-        r.paid = bool(data.get("placeno"))
+        paid_in = _parse_boolish(data.get("placeno"))
+    else:
+        for k in ("paid", "is_paid", "payment_status", "status"):
+            if k in data:
+                paid_in = _parse_boolish(data.get(k))
+                break
+    if paid_in is not None:
+        r.paid = bool(paid_in)
 
-    # server-side recompute balance (no auto-paid)
+    # server-side recompute balance with paid awareness
     T = _money_to_number(r.total)
     D = _money_to_number(r.deposit)
-    if T is not None and D is not None:
-        bal = round(T - D, 2)
-        r.balance = f"{bal:.2f}"
-    # NOTE: do NOT auto-set r.paid based on balance; user controls "placeno" manually.
+    if bool(r.paid):
+        # When paid, keep balance at 0.00 regardless of T/D
+        r.balance = "0.00"
+    else:
+        if T is not None and D is not None:
+            bal = round(T - D, 2)
+            r.balance = f"{bal:.2f}"
+        # if we can't compute (missing numbers), leave as-is string
+    # NOTE: do NOT auto-set r.paid based on balance; user controls "placeno/paid" manually.
 
     db.session.commit()
     # nakon upisa – provjeri da li je došlo do prelaza na plaćeno i pošalji mail
@@ -1160,6 +1189,7 @@ def containers_update(cid):
     return jsonify(r.to_dict())
 
 
+
 @app.delete('/api/containers/<int:cid>')
 @jwt_required()
 def containers_delete(cid):
@@ -1167,6 +1197,157 @@ def containers_delete(cid):
     db.session.delete(r)
     db.session.commit()
     return jsonify({"ok": True, "deleted_id": cid})
+
+
+# Import containers from Excel/CSV
+@app.route('/api/containers/import', methods=['POST', 'OPTIONS'])
+def import_containers():
+    """Import containers from an uploaded Excel (.xlsx/.xls) or CSV file.
+    Expects a multipart/form-data with field name 'file'.
+    Returns a JSON summary with counts and any row-level errors.
+    """
+    # CORS preflight support
+    if request.method == 'OPTIONS':
+        return ("", 204)
+
+    # Validate file presence
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part in request'}), 400
+    f = request.files['file']
+    if not f or f.filename.strip() == '':
+        return jsonify({'error': 'Empty filename'}), 400
+
+    filename = secure_filename(f.filename)
+    ext = os.path.splitext(filename)[1].lower()
+
+    # Lazy import so the app boots even if pandas/openpyxl are missing
+    try:
+        import pandas as pd
+    except Exception as e:
+        return jsonify({'error': 'pandas not installed on server', 'detail': str(e)}), 500
+
+    # Parse the file into a DataFrame
+    try:
+        if ext in ('.xlsx', '.xls'):
+            df = pd.read_excel(f)
+        elif ext == '.csv':
+            try:
+                df = pd.read_csv(f)
+            except UnicodeDecodeError:
+                f.stream.seek(0)
+                df = pd.read_csv(f, encoding='latin-1')
+        else:
+            return jsonify({'error': 'Unsupported file type. Use .xlsx, .xls or .csv'}), 415
+    except Exception as e:
+        return jsonify({'error': 'Failed to read file', 'detail': str(e)}), 400
+
+    # Normalize headers (lowercase, trimmed)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    def pick(row, *aliases, default=""):
+        for a in aliases:
+            if a in row and pd.notna(row[a]):
+                return row[a]
+        return default
+
+    def to_number(v, default=0.0):
+        try:
+            s = str(v).strip()
+            if not s:
+                return default
+            # remove currency and spaces, normalize decimal comma
+            s = s.replace('€', '').replace('$', '').replace('\u00A0', ' ').replace(' ', '')
+            if ',' in s and '.' in s:
+                s = s.replace('.', '').replace(',', '.')
+            else:
+                s = s.replace(',', '.')
+            return float(s)
+        except Exception:
+            return default
+
+    created, updated, errors = 0, 0, []
+
+    for idx, row in df.iterrows():
+        try:
+            # Read values with common aliases from your sample sheet
+            supplier     = pick(df.loc[idx], 'supplier', 'dobavljač', 'dobavljac')
+            proforma_no  = pick(df.loc[idx], 'proforma', 'proforma no', 'proforma_no')
+            etd_raw      = pick(df.loc[idx], 'etd')
+            delivery_raw = pick(df.loc[idx], 'delivery')
+            eta_raw      = pick(df.loc[idx], 'eta')
+            cargo_qty    = pick(df.loc[idx], 'qty', 'količina', 'kolicina', default="")
+            cargo        = pick(df.loc[idx], 'tip', 'cargo', 'type')
+            container_no = pick(df.loc[idx], 'kontejner', 'container', 'container no', 'container_no')
+            roba         = pick(df.loc[idx], 'roba', 'goods', 'product')
+            contain_price= pick(df.loc[idx], 'cijena', 'cena', 'price', 'contain_price')
+            agent        = pick(df.loc[idx], 'agent')
+            total        = pick(df.loc[idx], 'total', 'ukupno')
+            deposit      = pick(df.loc[idx], 'deposit', 'depozit')
+            balance      = pick(df.loc[idx], 'balance', 'balans')
+            paid_raw     = pick(df.loc[idx], 'paid', 'plaćeno', 'placeno', 'status')
+
+            # Dates – reuse backend helper by feeding ISO where possible
+            def to_date_str(v):
+                if pd.isna(v) or v is None or str(v).strip() == '':
+                    return None
+                # pandas may give Timestamp; keep ISO date part
+                try:
+                    return pd.to_datetime(v).date().isoformat()
+                except Exception:
+                    return str(v)
+
+            etd_s      = to_date_str(etd_raw)
+            delivery_s = to_date_str(delivery_raw)
+            eta_s      = to_date_str(eta_raw)
+
+            # Numeric-like
+            total_f   = to_number(total, 0.0)
+            deposit_f = to_number(deposit, 0.0)
+            balance_f = to_number(balance, total_f - deposit_f)
+
+            # Paid flag
+            paid = False
+            if isinstance(paid_raw, bool):
+                paid = paid_raw
+            else:
+                s = str(paid_raw).strip().lower()
+                if s in ('1','true','yes','y','da','paid','plaćeno','placeno'):
+                    paid = True
+
+            # If paid, force balance 0.00
+            if paid:
+                balance_f = 0.0
+
+            # Create and store row
+            rec = Container(
+                supplier=str(supplier or ''),
+                proforma_no=str(proforma_no or ''),
+                etd=_parse_date_any(etd_s),
+                delivery=_parse_date_any(delivery_s),
+                eta=_parse_date_any(eta_s),
+                cargo_qty=str(cargo_qty or ''),
+                cargo=str(cargo or ''),
+                container_no=str(container_no or ''),
+                roba=str(roba or ''),
+                contain_price=str(pick(df.loc[idx], 'contain_price', 'cijena', 'price') or ''),
+                agent=str(agent or ''),
+                total=f"{total_f:.2f}",
+                deposit=f"{deposit_f:.2f}",
+                balance=f"{balance_f:.2f}",
+                paid=bool(paid),
+            )
+            db.session.add(rec)
+            created += 1
+        except Exception as e:
+            errors.append({'row': int(idx) + 2, 'error': str(e)})  # +2 for header + 1-index
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': 'DB commit failed', 'detail': str(e), 'created': created, 'errors': errors}), 500
+
+    return jsonify({'ok': True, 'created': created, 'updated': updated, 'errors': errors}), 201
 
 # KPI
 @app.route('/api/kpi', methods=['GET'])
@@ -1176,6 +1357,34 @@ def kpi():
         counts[st] = Arrival.query.filter_by(status=st).count()
     total = Arrival.query.count()
     return jsonify({'total': total, 'by_status': counts})
+
+def _parse_boolish(val):
+    """
+    Best-effort parser that turns various truthy/falsy representations into bool.
+    Accepts: True/False, 1/0, "true"/"false", "yes"/"no", "da"/"ne",
+    "paid"/"unpaid", "placeno"/"nije placeno", "plaćeno"/"nije plaćeno".
+    Returns True/False or None if undecidable.
+    """
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    try:
+        # Numbers: 0/1
+        if isinstance(val, (int, float)):
+            return bool(int(val))
+    except Exception:
+        pass
+    s = str(val).strip().lower()
+    if s in ("true", "1", "yes", "y", "da"):
+        return True
+    if s in ("false", "0", "no", "n", "ne"):
+        return False
+    if s in ("paid", "plaćeno", "placeno"):
+        return True
+    if s in ("unpaid", "nije plaćeno", "nije placeno"):
+        return False
+    return None
 
 # --- Utility parsers ---
 def _parse_iso(val):
