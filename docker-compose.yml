@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  backend:  # Production-like (Gunicorn)
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8081:5000"
+    env_file:
+      - .env  # optional; if you have DB URL, CORS origins, etc.
+    restart: unless-stopped
+    container_name: arrivals-backend
+    command: gunicorn -w 3 -k gthread -b 0.0.0.0:5000 app:app
+    environment:
+      - TZ=Europe/Podgorica
+      - MAIL_DEBUG=0
+
+  backend-dev:  # Hot-reload dev server
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8082:5000"   # dev on 8082 to avoid clashing with prod and easy to remember next to 8081
+    volumes:
+      - .:/app        # live code mount
+    env_file:
+      - .env          # optional
+    restart: unless-stopped
+    container_name: arrivals-backend-dev
+    command: flask run --host=0.0.0.0 --port=5000
+    environment:
+      - FLASK_APP=app.py
+      - FLASK_ENV=development
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Podgorica
+      - MAIL_DEBUG=0
