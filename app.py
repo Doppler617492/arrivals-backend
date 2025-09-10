@@ -23,30 +23,58 @@ load_dotenv()
 
 app = Flask(__name__)
 
+ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
 CORS(
     app,
-    resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "*"]},
-               r"/auth/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "*"]},
-               r"/files/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "*"]},
-               r"/": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "*"]}},
-    supports_credentials=False,
-    methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"]
+    resources={
+        r"/api/*": {"origins": ALLOWED_ORIGINS},
+        r"/auth/*": {"origins": ALLOWED_ORIGINS},
+        r"/files/*": {"origins": ALLOWED_ORIGINS},
+        r"/health": {"origins": ALLOWED_ORIGINS},
+        r"/": {"origins": ALLOWED_ORIGINS},
+    },
+    supports_credentials=True,
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    expose_headers=["Content-Type", "Authorization"],
+    max_age=86400,
 )
 
 # Catch-all OPTIONS handler for CORS preflight requests
 @app.route('/<path:_any>', methods=['OPTIONS'])
 def _cors_preflight(_any):
-    # Generic 204 for all preflight requests
-    return ("", 204)
+    # Credentials-safe CORS preflight response with allowed headers, methods, and origin
+    origin = request.headers.get("Origin")
+    headers = {}
+    if origin in (ALLOWED_ORIGINS or []):
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Vary"] = "Origin"
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+        headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+    return ("", 204, headers)
 
 # After-request hook to set CORS headers if missing
 @app.after_request
 def _add_cors_fallback(resp):
-    # Fallback headers in case any response slips past Flask-CORS
-    resp.headers.setdefault("Access-Control-Allow-Origin", "*")
-    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
-    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS, HEAD")
+    # Force credentials-safe CORS headers (never wildcard when cookies are used)
+    origin = request.headers.get("Origin")
+    if origin in (ALLOWED_ORIGINS or []):
+        resp.headers["Access-Control-Allow-Origin"] = origin  # overwrite any previous value (avoid '*')
+        # Merge with existing Vary header if present
+        if resp.headers.get("Vary"):
+            if "Origin" not in resp.headers.get("Vary"):
+                resp.headers["Vary"] = resp.headers.get("Vary") + ", Origin"
+        else:
+            resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
+        resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
+    else:
+        # If not an allowed origin, drop wildcard if any slipped through
+        if resp.headers.get("Access-Control-Allow-Origin") == "*":
+            del resp.headers["Access-Control-Allow-Origin"]
     return resp
 
 # --- Config ---
@@ -449,6 +477,22 @@ def health_route():
     if request.method == 'OPTIONS':
         return ("", 204)
     return jsonify({"ok": True})
+
+# Notifications (placeholder to avoid 405s on frontend)
+@app.route('/notifications', methods=['GET', 'POST', 'OPTIONS'])
+def notifications():
+    if request.method == 'OPTIONS':
+        origin = request.headers.get("Origin")
+        headers = {}
+        if origin in (ALLOWED_ORIGINS or []):
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+            headers["Access-Control-Allow-Credentials"] = "true"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+        return ("", 204, headers)
+    # GET returns notifications; POST can acknowledge/clear (placeholder)
+    return jsonify([])
 
 
 # --- Auth ---
