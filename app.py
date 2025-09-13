@@ -8,7 +8,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import relationship
-from sqlalchemy import or_, text
+from sqlalchemy import or_, text, func
 from functools import wraps
 import os
 import time
@@ -222,6 +222,9 @@ class Arrival(db.Model):
     goods_cost = db.Column(db.Float)              # cijena robe
     customs_cost = db.Column(db.Float)
     currency = db.Column(db.String(8), default='EUR')
+    # Odgovorna osoba i lokacija
+    responsible = db.Column(db.String(120))
+    location = db.Column(db.String(120))
 
     # Asignacija i notifikacija
     assignee_id = db.Column(db.Integer, db.ForeignKey('user.id'))
@@ -270,10 +273,13 @@ class Arrival(db.Model):
             'goods_cost': self.goods_cost,
             'customs_cost': self.customs_cost,
             'currency': self.currency,
+            'responsible': (self.responsible or ''),
+            'location': (self.location or ''),
             'assignee_id': self.assignee_id,
             'progress': pct,
             'days_left': days_left,
             'overdue': overdue,
+            'files_count': (len(self.files) if getattr(self, 'files', None) is not None else 0),
         }
 
 # --- Container model ---
@@ -331,10 +337,10 @@ class Container(db.Model):
 ROLE_FIELDS = {
     'admin': {'supplier','carrier','plate','type','eta','status','note','order_date','production_due',
               'shipped_at','arrived_at','customs_info','freight_cost','customs_cost','currency','assignee_id',
-              'driver','pickup_date','goods_cost'},
-    'planer': {'supplier','order_date','production_due','status','note'},
+              'driver','pickup_date','goods_cost','responsible','location'},
+    'planer': {'supplier','order_date','production_due','status','note','location'},
     'proizvodnja': {'status','note'},
-    'transport': {'carrier','plate','eta','status','shipped_at','note','driver','pickup_date','freight_cost'},
+    'transport': {'carrier','plate','eta','status','shipped_at','note','driver','pickup_date','freight_cost','location'},
     'carina': {'status','customs_info','customs_cost','note'},
     'viewer': set(),
 }
@@ -635,12 +641,25 @@ def update_user(uid):
 @app.route('/api/arrivals', methods=['GET'])
 def list_arrivals():
     arrivals = Arrival.query.order_by(Arrival.created_at.desc()).all()
-    return jsonify([a.to_dict() for a in arrivals])
+    # Precompute file counts for all arrivals in one query (robust & fast)
+    counts_map = dict(
+        db.session.query(ArrivalFile.arrival_id, func.count(ArrivalFile.id))
+        .group_by(ArrivalFile.arrival_id)
+        .all()
+    )
+    results = []
+    for a in arrivals:
+        d = a.to_dict()
+        d["files_count"] = int(counts_map.get(a.id, 0))
+        results.append(d)
+    return jsonify(results)
 
 @app.route('/api/arrivals/<int:id>', methods=['GET'])
 def get_arrival(id):
     a = Arrival.query.get_or_404(id)
-    return jsonify(a.to_dict())
+    d = a.to_dict()
+    d["files_count"] = db.session.query(func.count(ArrivalFile.id)).filter(ArrivalFile.arrival_id == a.id).scalar() or 0
+    return jsonify(d)
 
 @app.route('/api/arrivals/search', methods=['GET'])
 def search_arrivals():
@@ -695,11 +714,34 @@ def search_arrivals():
 
     total = query.count()
     items = query.order_by(sort_expr).offset((page - 1) * per_page).limit(per_page).all()
-    return jsonify({'page': page, 'per_page': per_page, 'total': total, 'items': [a.to_dict() for a in items]})
+    item_ids = [a.id for a in items]
+    counts_map = {}
+    if item_ids:
+        counts_map = dict(
+            db.session.query(ArrivalFile.arrival_id, func.count(ArrivalFile.id))
+            .filter(ArrivalFile.arrival_id.in_(item_ids))
+            .group_by(ArrivalFile.arrival_id)
+            .all()
+        )
+    items_payload = []
+    for a in items:
+        d = a.to_dict()
+        d["files_count"] = int(counts_map.get(a.id, 0))
+        items_payload.append(d)
+    return jsonify({'page': page, 'per_page': per_page, 'total': total, 'items': items_payload})
 
 @app.route('/api/arrivals', methods=['POST'])
 def create_arrival():
     data = request.json or {}
+    # --- Normalize aliases for location (frontend may send different keys) ---
+    loc = data.get('location')
+    if not loc:
+        for alias in ('lokacija', 'store', 'shop', 'warehouse'):
+            if alias in data and data.get(alias):
+                loc = data.get(alias)
+                break
+    if isinstance(loc, str):
+        loc = loc.strip()
     attempted_fields = set(data.keys() or [])
     ok, role, uid, err = check_api_or_jwt(attempted_fields)
     if not ok:
@@ -723,6 +765,8 @@ def create_arrival():
         goods_cost=_parse_float(data.get('goods_cost')),
         customs_cost=_parse_float(data.get('customs_cost')),
         currency=(data.get('currency') or 'EUR')[:8],
+        responsible=data.get('responsible'),
+        location=loc,
         assignee_id=data.get('assignee_id')
     )
     db.session.add(a); db.session.commit()
@@ -738,6 +782,18 @@ def update_arrival(id):
     if not ok:
         return err
 
+    # --- Normalize aliases for location and write back into data ---
+    if 'location' not in data or (isinstance(data.get('location'), str) and not data.get('location').strip()):
+        loc = None
+        for alias in ('lokacija', 'store', 'shop', 'warehouse'):
+            if alias in data and data.get(alias):
+                loc = data.get(alias)
+                break
+        if isinstance(loc, str):
+            loc = loc.strip()
+        if loc is not None:
+            data['location'] = loc
+
     # If JWT (non-admin), restrict to editable fields for their role
     editable = ROLE_FIELDS.get(role, set()) if role and role != 'system' else None
     def can_set(field):
@@ -745,7 +801,22 @@ def update_arrival(id):
             return True
         return field in (editable or set())
 
-    for field in ['supplier','carrier','plate','driver','type','eta','status','note','customs_info','currency','assignee_id']:
+    # --- Field alias normalization (accept common frontend variants) ---
+    # transport_type -> type
+    if 'transport_type' in data and 'type' not in data and can_set('type'):
+        data['type'] = data.get('transport_type')
+    # assignee / assignee_name -> responsible (fallback if responsible not explicitly provided)
+    if 'responsible' not in data:
+        if 'assignee_name' in data and can_set('responsible'):
+            data['responsible'] = data.get('assignee_name')
+        elif 'assignee' in data and can_set('responsible'):
+            data['responsible'] = data.get('assignee')
+    # normalize empty strings for simple text fields so they persist consistently
+    for _k in ('responsible', 'location'):
+        if _k in data and isinstance(data[_k], str):
+            data[_k] = data[_k].strip()
+
+    for field in ['supplier','carrier','plate','driver','type','eta','status','note','customs_info','currency','assignee_id','responsible','location']:
         if field in data and can_set(field):
             setattr(a, field, data[field])
     if 'order_date' in data and can_set('order_date'): a.order_date = _parse_iso(data.get('order_date'))
@@ -818,6 +889,16 @@ def delete_arrival(id):
     a = Arrival.query.get(id)
     if not a:
         return jsonify({'error': 'Not found'}), 404
+    # Remove all files from disk for this arrival
+    try:
+        for f in list(getattr(a, "files", []) or []):
+            try:
+                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], f.filename))
+            except Exception:
+                # ignore per-file deletion errors
+                pass
+    except Exception:
+        pass
     db.session.delete(a)
     db.session.commit()
     return jsonify({'ok': True, 'deleted_id': id}), 200
@@ -843,6 +924,18 @@ def bulk_delete_arrivals():
 
     if not ids:
         return jsonify({'ok': True, 'deleted': []})
+
+    # Remove all related files from disk for these arrivals
+    try:
+        file_rows = db.session.query(ArrivalFile.filename).filter(ArrivalFile.arrival_id.in_(ids)).all()
+        for (fname,) in file_rows:
+            try:
+                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], fname))
+            except Exception:
+                # ignore per-file deletion errors
+                pass
+    except Exception:
+        pass
 
     db.session.query(Arrival).filter(Arrival.id.in_(ids)).delete(synchronize_session=False)
     db.session.commit()
@@ -884,6 +977,17 @@ def delete_arrivals_querystring():
 
     if not ids:
         return jsonify({'ok': True, 'deleted': []})
+
+    # Remove all related files from disk for these arrivals
+    try:
+        file_rows = db.session.query(ArrivalFile.filename).filter(ArrivalFile.arrival_id.in_(ids)).all()
+        for (fname,) in file_rows:
+            try:
+                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], fname))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     db.session.query(Arrival).filter(Arrival.id.in_(ids)).delete(synchronize_session=False)
     db.session.commit()
@@ -1401,6 +1505,64 @@ def kpi():
         counts[st] = Arrival.query.filter_by(status=st).count()
     total = Arrival.query.count()
     return jsonify({'total': total, 'by_status': counts})
+# Options for dropdowns
+@app.get('/api/options/responsibles')
+def options_responsibles():
+    # Allow env-based override: RESPONSIBLES="Ludvig,Gazi,Gezim,Armir"
+    from_env = (os.environ.get('RESPONSIBLES') or '').strip()
+    if from_env:
+        vals = [v.strip() for v in from_env.split(',') if v.strip()]
+    else:
+        vals = ["Ludvig", "Gazi", "Gezim", "Armir"]
+    return jsonify(vals)
+
+@app.get('/api/options/locations')
+def options_locations():
+    """
+    Returns the list of allowed shop/warehouse locations for dropdowns.
+    Priority:
+      1) LOCATIONS env var (comma-separated) if present.
+      2) Fixed list provided by the business.
+      3) Any additional distinct, non-empty locations already present in DB (appended).
+    """
+    # 1) Environment override
+    from_env = (os.environ.get('LOCATIONS') or '').strip()
+    if from_env:
+        base_list = [v.strip() for v in from_env.split(',') if v.strip()]
+    else:
+        # 2) Fixed list from the user (trimmed, order preserved)
+        base_list = [
+            "Veleprodajni magaci",
+            "Pg Centar",
+            "Pg",
+            "Bar",
+            "Bar Centar",
+            "Budva",
+            "Kotor Centar",
+            "Herceg Novi",
+            "Herceg Novi Centar",
+            "Niksic",
+            "Bijelo polje",
+            "Ulcinj Centar",
+        ]
+
+    # 3) Union with distinct locations already stored in the DB
+    try:
+        rows = db.session.query(Arrival.location).filter(Arrival.location.isnot(None)).all()
+        extra = [(r[0] or '').strip() for r in rows if (r[0] or '').strip()]
+    except Exception:
+        extra = []
+
+    # Deduplicate while preserving order: base_list first, then extras not already present
+    seen = set()
+    result = []
+    for v in base_list + extra:
+        k = v.strip()
+        if k and k not in seen:
+            seen.add(k)
+            result.append(k)
+
+    return jsonify(result)
 
 def _parse_boolish(val):
     """
@@ -1563,6 +1725,8 @@ def soft_migrate():
         'driver': 'VARCHAR(120)',
         'pickup_date': 'DATETIME',
         'goods_cost': 'FLOAT',
+        'responsible': 'VARCHAR(120)',
+        'location': 'VARCHAR(120)',
     }
     for c, t in cols.items():
         if not column_exists('arrival', c):
