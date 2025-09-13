@@ -1174,9 +1174,51 @@ def delete_container_file(cid, file_id):
     db.session.commit()
     return jsonify({'ok': True, 'deleted_id': file_id})
 
-@app.route('/files/<path:filename>', methods=['GET'])
+@app.route('/files/<path:filename>', methods=['GET', 'HEAD', 'OPTIONS'])
 def get_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
+    # CORS preflight
+    if request.method == 'OPTIONS':
+        origin = request.headers.get("Origin")
+        headers = {}
+        if origin in (ALLOWED_ORIGINS or []):
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+            headers["Access-Control-Allow-Credentials"] = "true"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+        return ("", 204, headers)
+
+    # Support both `?download=1` and `?inline=1` toggles
+    download_q = (request.args.get('download') or '').strip().lower()
+    inline_q = (request.args.get('inline') or '').strip().lower()
+    # Default to inline preview; allow `?download=1` to force download
+    as_att = download_q in ('1', 'true', 'yes', 'on') and not (inline_q in ('1','true','yes','on'))
+
+    try:
+        resp = send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=as_att)
+        # Ensure credentials-safe CORS headers (avoid wildcard when cookies are used)
+        origin = request.headers.get("Origin")
+        if origin in (ALLOWED_ORIGINS or []):
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            # Merge with existing Vary header if present
+            if resp.headers.get("Vary"):
+                if "Origin" not in resp.headers.get("Vary"):
+                    resp.headers["Vary"] = resp.headers.get("Vary") + ", Origin"
+            else:
+                resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
+            resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
+        return resp
+    except FileNotFoundError:
+        return jsonify({'error': 'Not found'}), 404
+
+
+# Legacy/compatibility route for accidental double /files/files/ URLs
+@app.route('/files/files/<path:filename>', methods=['GET', 'HEAD', 'OPTIONS'])
+def get_file_compat(filename):
+    # Delegate to the canonical handler
+    return get_file(filename)
 
 # Containers CRUD + search
 @app.get('/api/containers')
