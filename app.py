@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, redirect
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from flask_jwt_extended import (
@@ -17,13 +17,69 @@ import smtplib
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 
-from mailer import maybe_notify_paid
+# Optional/legacy modules (guarded so app can start even if they don't exist)
+try:
+    from mailer import maybe_notify_paid  # noqa: F401
+except Exception:
+    pass
+
+try:
+    from db import Base, engine, SessionLocal, get_db  # noqa: F401
+except Exception:
+    pass
 
 load_dotenv()
 
+# --- Modular config/extensions (safe import with fallbacks) ---
+try:
+    from extensions import db, jwt  # externalized singletons
+except Exception:
+    # Fallback definitions if extensions.py doesn't exist yet
+    from flask_sqlalchemy import SQLAlchemy
+    from flask_jwt_extended import JWTManager
+    db = SQLAlchemy()
+    jwt = JWTManager()
+
+try:
+    from config import load_config, allowed_origins
+except Exception:
+    # Fallback inline config helpers if config.py doesn't exist yet
+    import os as _os
+    _DEFAULT_ALLOWED = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+    def allowed_origins():
+        raw = (_os.environ.get("ALLOWED_ORIGINS") or "").strip()
+        if not raw:
+            return _DEFAULT_ALLOWED
+        return [o.strip() for o in raw.split(",") if o.strip()]
+
+    def load_config(app):
+        app.config['SQLALCHEMY_DATABASE_URI'] = _os.environ.get(
+            'DATABASE_URL',
+            _os.environ.get('SQLITE_URL', 'sqlite:///arrivals.db')
+        )
+        app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+        app.config['JWT_SECRET_KEY'] = _os.environ.get('JWT_SECRET_KEY', 'change-me-dev')
+        app.config['JWT_TOKEN_LOCATION'] = ['headers']
+        app.config['JWT_COOKIE_CSRF_PROTECT'] = False
+
+        upload_dir_env = _os.environ.get('UPLOAD_DIR') or _os.environ.get('UPLOAD_FOLDER')
+        app.config['UPLOAD_FOLDER'] = upload_dir_env or _os.path.join(_os.path.dirname(__file__), 'uploads')
+        _os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+        # Limit upload size via env (default 16 MB)
+        app.config['MAX_CONTENT_LENGTH'] = int(_os.environ.get('MAX_UPLOAD_MB', '16')) * 1024 * 1024
+
 app = Flask(__name__)
 
-ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+# Allowed CORS origins (env override via ALLOWED_ORIGINS)
+ALLOWED_ORIGINS = allowed_origins()
+
+# Core blueprint (enabled now that overlapping routes are removed)
+from routes.core import bp as core_bp
+app.register_blueprint(core_bp, url_prefix="")
+
+
 
 CORS(
     app,
@@ -78,18 +134,7 @@ def _add_cors_fallback(resp):
     return resp
 
 # --- Config ---
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///arrivals.db')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'change-me-dev')
-app.config['JWT_TOKEN_LOCATION'] = ['headers']
-app.config['JWT_COOKIE_CSRF_PROTECT'] = False
-
-upload_dir_env = os.environ.get('UPLOAD_DIR') or os.environ.get('UPLOAD_FOLDER')
-app.config['UPLOAD_FOLDER'] = upload_dir_env or os.path.join(os.path.dirname(__file__), 'uploads')
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
-# Limit upload size via env (default 16 MB)
-app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', '16')) * 1024 * 1024
+load_config(app)
 
 # Mail / SLA
 # Sensible defaults for Gmail (App Password required):
@@ -117,7 +162,7 @@ NOTIFY_ON_SLA = os.environ.get('NOTIFY_ON_SLA', 'true').lower() == 'true'
 NOTIFY_ON_PAID = os.environ.get('NOTIFY_ON_PAID', 'true').lower() == 'true'
 SLA_CHECK_SECONDS = int(os.environ.get('SLA_CHECK_SECONDS', '3600'))
 
-jwt = JWTManager(app)
+jwt.init_app(app)
 
 # JWT error/unauthorized handlers
 @jwt.unauthorized_loader
@@ -136,7 +181,7 @@ def _jwt_expired(jwt_header, jwt_payload):
 def _jwt_needs_fresh(jwt_header, jwt_payload):
     return jsonify({"error": "Fresh token required"}), 401
 
-db = SQLAlchemy(app)
+db.init_app(app)
 
 # API-friendly error handlers
 @app.errorhandler(400)
@@ -160,178 +205,28 @@ def _method_not_allowed(e):
 def _too_large(e):
     return jsonify({"error": "File too large"}), 413
 
-# --- Models ---
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(255), unique=True, nullable=False)
-    name = db.Column(db.String(120))
-    role = db.Column(db.String(32), default='viewer')  # admin, planer, proizvodnja, transport, carina, viewer
-    password_hash = db.Column(db.String(255), nullable=False)
+# --- Models (imported from models.py) ---
+from models import (
+    User as User,
+    Arrival as Arrival,
+    ArrivalFile as ArrivalFile,
+    ArrivalUpdate as ArrivalUpdate,
+    Container as Container,
+    ContainerFile as ContainerFile,
+)
 
-    def set_password(self, raw: str):
-        self.password_hash = generate_password_hash(raw)
-
-    def check_password(self, raw: str) -> bool:
-        return check_password_hash(self.password_hash, raw)
-
-class ArrivalUpdate(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    arrival_id = db.Column(db.Integer, db.ForeignKey('arrival.id'), nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
-    message = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-
-class ArrivalFile(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    arrival_id = db.Column(db.Integer, db.ForeignKey('arrival.id'), nullable=False)
-    filename = db.Column(db.String(255), nullable=False)
-    original_name = db.Column(db.String(255), nullable=False)
-    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-# --- ContainerFile model ---
-class ContainerFile(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    container_id = db.Column(db.Integer, db.ForeignKey('containers.id'), nullable=False)
-    filename = db.Column(db.String(255), nullable=False)
-    original_name = db.Column(db.String(255), nullable=False)
-    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-class Arrival(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    supplier = db.Column(db.String(120), nullable=False)
-    carrier = db.Column(db.String(120))
-    plate = db.Column(db.String(32))
-    driver = db.Column(db.String(120))            # name of the driver (Šofer)
-    pickup_date = db.Column(db.DateTime)          # datum za podizanje robe
-    type = db.Column(db.String(32), default="truck")
-    eta = db.Column(db.String(32))
-    status = db.Column(db.String(32), default="announced")
-    note = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-    # Workflow/plan fields
-    order_date = db.Column(db.DateTime)             # datum narudžbe
-    production_due = db.Column(db.DateTime)         # rok završetka proizvodnje
-    shipped_at = db.Column(db.DateTime)             # datum kad je poslano
-    arrived_at = db.Column(db.DateTime)             # datum kad je stiglo
-
-    # Finansije / carina
-    customs_info = db.Column(db.Text)
-    freight_cost = db.Column(db.Float)
-    goods_cost = db.Column(db.Float)              # cijena robe
-    customs_cost = db.Column(db.Float)
-    currency = db.Column(db.String(8), default='EUR')
-    # Odgovorna osoba i lokacija
-    responsible = db.Column(db.String(120))
-    location = db.Column(db.String(120))
-
-    # Asignacija i notifikacija
-    assignee_id = db.Column(db.Integer, db.ForeignKey('user.id'))
-    production_overdue_notified = db.Column(db.Boolean, default=False)
-
-    updates = relationship('ArrivalUpdate', backref='arrival', cascade='all, delete-orphan')
-    files = relationship('ArrivalFile', backref='arrival', cascade='all, delete-orphan')
-
-    def progress_and_overdue(self):
-        """
-        Progres od order_date do production_due.
-        """
-        if not self.order_date or not self.production_due:
-            return 0, None, False
-        now = datetime.now(timezone.utc)
-        # Pohranili smo kao naive? Pokušaj tretirati kao naive u UTC
-        start = self.order_date.replace(tzinfo=timezone.utc) if self.order_date.tzinfo is None else self.order_date
-        end = self.production_due.replace(tzinfo=timezone.utc) if self.production_due.tzinfo is None else self.production_due
-        total = (end - start).total_seconds()
-        done = (now - start).total_seconds()
-        pct = 0 if total <= 0 else max(0, min(100, int((done / total) * 100)))
-        days_left = int((end - now).total_seconds() // 86400)
-        overdue = now > end
-        return pct, days_left, overdue
-
-    def to_dict(self):
-        pct, days_left, overdue = self.progress_and_overdue()
-        return {
-            'id': self.id,
-            'supplier': self.supplier,
-            'carrier': self.carrier,
-            'plate': self.plate,
-            'driver': self.driver,
-            'pickup_date': self.pickup_date.isoformat() if self.pickup_date else None,
-            'type': self.type,
-            'eta': self.eta,
-            'status': self.status,
-            'note': self.note,
-            'created_at': self.created_at.isoformat(),
-            'order_date': self.order_date.isoformat() if self.order_date else None,
-            'production_due': self.production_due.isoformat() if self.production_due else None,
-            'shipped_at': self.shipped_at.isoformat() if self.shipped_at else None,
-            'arrived_at': self.arrived_at.isoformat() if self.arrived_at else None,
-            'customs_info': self.customs_info,
-            'freight_cost': self.freight_cost,
-            'goods_cost': self.goods_cost,
-            'customs_cost': self.customs_cost,
-            'currency': self.currency,
-            'responsible': (self.responsible or ''),
-            'location': (self.location or ''),
-            'assignee_id': self.assignee_id,
-            'progress': pct,
-            'days_left': days_left,
-            'overdue': overdue,
-            'files_count': (len(self.files) if getattr(self, 'files', None) is not None else 0),
-        }
-
-# --- Container model ---
-class Container(db.Model):
-    __tablename__ = "containers"
-    id = db.Column(db.Integer, primary_key=True)
-
-    supplier = db.Column(db.String(255), default="")
-    proforma_no = db.Column(db.String(255), default="")
-
-    etd = db.Column(db.Date, nullable=True)
-    delivery = db.Column(db.Date, nullable=True)
-    eta = db.Column(db.Date, nullable=True)
-
-    cargo_qty = db.Column(db.String(64), default="")
-    cargo = db.Column(db.String(255), default="")
-    container_no = db.Column(db.String(128), default="")
-    roba = db.Column(db.String(255), default="")
-    contain_price = db.Column(db.String(64), default="")
-    agent = db.Column(db.String(128), default="")
-
-    total = db.Column(db.String(64), default="")
-    deposit = db.Column(db.String(64), default="")
-    balance = db.Column(db.String(64), default="")
-    paid = db.Column(db.Boolean, default=False)
-
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    files = relationship('ContainerFile', backref='container', cascade='all, delete-orphan')
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "supplier": self.supplier or "",
-            "proformaNo": self.proforma_no or "",
-            "etd": self.etd.isoformat() if self.etd else "",
-            "delivery": self.delivery.isoformat() if self.delivery else "",
-            "eta": self.eta.isoformat() if self.eta else "",
-            "cargoQty": self.cargo_qty or "",
-            "cargo": self.cargo or "",
-            "containerNo": self.container_no or "",
-            "roba": self.roba or "",
-            "containPrice": self.contain_price or "",
-            "agent": self.agent or "",
-            "total": self.total or "",
-            "deposit": self.deposit or "",
-            "balance": self.balance or "",
-            "placeno": bool(self.paid),
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
+# Create missing tables in development by default to avoid 500s on first run
+if os.environ.get('AUTO_CREATE_TABLES', '1').lower() in ('1','true','yes','on'):
+    try:
+        with app.app_context():
+            db.create_all()
+            # Optionally seed admin if env provided
+            try:
+                ensure_admin()
+            except Exception:
+                pass
+    except Exception as e:
+        print('[DB INIT] create_all failed:', e)
 
 # --- Role permissions ---
 ROLE_FIELDS = {
@@ -473,16 +368,148 @@ def all_user_emails():
     return emails or MAIL_DEFAULT_TO
 
 # --- Routes ---
-@app.route('/', methods=['GET'])
-def health():
-    return jsonify({"ok": True, "routes": ["/api/arrivals","/api/containers","/auth/login"]})
 
-# Simple health endpoint for CLI checks and uptime probes
-@app.route('/health', methods=['GET', 'HEAD', 'OPTIONS'])
-def health_route():
+# Fallback list for arrivals (guards against 405/308 edge-cases)
+@app.route('/api/arrivals', methods=['GET', 'HEAD', 'OPTIONS'])
+def arrivals_list_fallback():
+    # Handle CORS preflight explicitly
     if request.method == 'OPTIONS':
-        return ("", 204)
-    return jsonify({"ok": True})
+        origin = request.headers.get("Origin")
+        headers = {}
+        if origin in (ALLOWED_ORIGINS or []):
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+            headers["Access-Control-Allow-Credentials"] = "true"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+        return ("", 204, headers)
+
+    try:
+        # GET/HEAD: mirror the blueprint's list output (including files_count)
+        rows = Arrival.query.order_by(Arrival.created_at.desc()).all()
+        counts_map = dict(
+            db.session.query(ArrivalFile.arrival_id, func.count(ArrivalFile.id))
+            .group_by(ArrivalFile.arrival_id).all()
+        )
+        payload = []
+        for a in rows:
+            d = a.to_dict()
+            d["files_count"] = int(counts_map.get(a.id, 0))
+            payload.append(d)
+        return jsonify(payload), 200
+    except Exception as e:
+        db.session.rollback()
+        print("[/api/arrivals ERROR]", e)
+        return jsonify({"error": "Server error", "detail": str(e)}), 500
+
+# Fallback list for containers (guards against 405/308 edge-cases)
+@app.route('/api/containers', methods=['GET', 'HEAD', 'OPTIONS'], strict_slashes=False)
+def containers_list_fallback():
+    # Handle CORS preflight explicitly
+    if request.method == 'OPTIONS':
+        origin = request.headers.get("Origin")
+        headers = {}
+        if origin in (ALLOWED_ORIGINS or []):
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+            headers["Access-Control-Allow-Credentials"] = "true"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+        return ("", 204, headers)
+
+    try:
+        # GET/HEAD: mirror the containers blueprint list (including files_count)
+        rows = Container.query.order_by(Container.created_at.desc()).all()
+        counts_map = dict(
+            db.session.query(ContainerFile.container_id, func.count(ContainerFile.id))
+            .group_by(ContainerFile.container_id).all()
+        )
+        payload = []
+        for c in rows:
+            d = c.to_dict()
+            d["files_count"] = int(counts_map.get(c.id, 0))
+            payload.append(d)
+        return jsonify(payload), 200
+    except Exception as e:
+        db.session.rollback()
+        print("[/api/containers ERROR]", e)
+        return jsonify({"error": "Server error", "detail": str(e)}), 500
+
+# Legacy mirror for containers list (no /api prefix)
+@app.route('/containers', methods=['GET', 'HEAD', 'OPTIONS'], strict_slashes=False)
+def containers_list_legacy():
+    # Reuse the same implementation as the /api prefixed endpoint
+    return containers_list_fallback()
+
+ 
+
+# Update a single container (fallback so the UI can PATCH even if the blueprint failed)
+@app.route('/api/containers/<int:cid>', methods=['PATCH', 'PUT', 'OPTIONS'], strict_slashes=False)
+def containers_update_fallback(cid):
+    # CORS preflight
+    if request.method == 'OPTIONS':
+        origin = request.headers.get("Origin")
+        headers = {}
+        if origin in (ALLOWED_ORIGINS or []):
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+            headers["Access-Control-Allow-Credentials"] = "true"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+        return ("", 204, headers)
+
+    # Permissions: allow API key or JWT role-based
+    data = request.get_json(silent=True) or {}
+    attempted_fields = set(data.keys())
+    allowed, role, uid, error_resp = check_api_or_jwt(attempted_fields)
+    if not allowed:
+        return error_resp
+
+    try:
+        obj = Container.query.get(cid)
+        if not obj:
+            return jsonify({"error": "Not found"}), 404
+
+        # Allowed fields to patch (keep in sync with model)
+        ALLOWED = {
+            'supplier','proforma_no','etd','delivery','eta','cargo_qty','cargo','container_no',
+            'roba','contain_price','agent','total','deposit','balance','paid','status','note',
+            'code'
+        }
+
+        # Apply incoming values with light parsing for dates/bools
+        for k, v in data.items():
+            if k not in ALLOWED:
+                continue
+            if k in ('etd','delivery','eta'):
+                setattr(obj, k, _parse_date_any(v))
+            elif k == 'paid':
+                pb = _parse_boolish(v)
+                setattr(obj, k, bool(pb) if pb is not None else False)
+            else:
+                # Keep numeric-like values as strings if your columns are VARCHAR
+                setattr(obj, k, v)
+
+        # Optional: auto-balance when paid toggled on
+        if 'paid' in data and getattr(obj, 'paid', False):
+            try:
+                total_f = _money_to_number(getattr(obj, 'total')) or 0.0
+                deposit_f = _money_to_number(getattr(obj, 'deposit')) or 0.0
+                obj.balance = f"{max(total_f - deposit_f, 0.0):.2f}"
+            except Exception:
+                pass
+
+        db.session.commit()
+        return jsonify(obj.to_dict()), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "Update failed", "detail": str(e)}), 500
+
+# Legacy mirror for container update (no /api prefix)
+@app.route('/containers/<int:cid>', methods=['PATCH', 'PUT', 'OPTIONS'], strict_slashes=False)
+def containers_update_legacy(cid):
+    # Reuse the same implementation as the /api prefixed endpoint
+    return containers_update_fallback(cid)
 
 # Notifications (placeholder to avoid 405s on frontend)
 @app.route('/notifications', methods=['GET', 'POST', 'OPTIONS'])
@@ -500,893 +527,27 @@ def notifications():
     # GET returns notifications; POST can acknowledge/clear (placeholder)
     return jsonify([])
 
+#
+# Explicit preflight for /auth/login (helps some browsers)
+@app.route('/auth/login', methods=['OPTIONS'])
+def _preflight_auth_login():
+    return ("", 204)
 
-# --- Auth ---
-@app.route('/auth/login', methods=['POST'])
-def auth_login():
-    data = request.json or {}
-    email = (data.get('email') or '').strip().lower()
-    password = data.get('password') or ''
-    user = User.query.filter_by(email=email).first()
-    if not user or not user.check_password(password):
-        return jsonify({'error': 'Invalid credentials'}), 401
-
-    identity = str(user.id)  # must be string
-    claims = {'email': user.email, 'name': user.name, 'role': user.role}
-    token = create_access_token(identity=identity, additional_claims=claims)
-    return jsonify({'access_token': token, 'user': {'id': user.id, 'email': user.email, 'name': user.name, 'role': user.role}})
-
-# --- Legacy compatibility routes (old frontend paths) ---
-# Some older clients may POST to /login instead of /auth/login.
-# This forwards those requests to the same handler to avoid 405 errors.
+# Legacy compatibility: keep old endpoints working by redirecting to blueprint paths
 @app.route('/login', methods=['POST', 'OPTIONS'])
-def legacy_login():
+def legacy_login_redirect():
     if request.method == 'OPTIONS':
-        # Preflight handled here explicitly, though global handler also covers it
         return ("", 204)
-    return auth_login()
+    # 307 preserves method and body for POST
+    return redirect('/auth/login', code=307)
 
-# Some older clients may call GET /me; forward to /auth/me
 @app.route('/me', methods=['GET'])
-@jwt_required()
-def legacy_me():
-    return auth_me()
+def legacy_me_redirect():
+    # 307 preserves method if this were non-GET; for GET it's a normal redirect
+    return redirect('/auth/me', code=307)
 
-# Refresh endpoint for JWT
-@app.route('/auth/refresh', methods=['POST'])
-@jwt_required()
-def auth_refresh():
-    claims = get_jwt() or {}
-    uid = get_jwt_identity()
-    if uid is None:
-        return jsonify({"error": "Unauthorized"}), 401
-    new_token = create_access_token(identity=str(uid), additional_claims={
-        "email": claims.get("email"),
-        "name": claims.get("name"),
-        "role": claims.get("role", "viewer"),
-    })
-    return jsonify({"access_token": new_token})
 
-@app.route('/auth/me', methods=['GET'])
-@jwt_required()
-def auth_me():
-    claims = get_jwt()
-    uid = get_jwt_identity()
-    user = User.query.get(int(uid))
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    return jsonify({'user': {'id': user.id, 'email': claims.get('email', user.email), 'name': claims.get('name', user.name), 'role': claims.get('role', user.role)}})
 
-# Users (admin only)
-@app.route('/users', methods=['GET'])
-@jwt_required()
-def list_users():
-    claims = get_jwt()
-    if claims.get('role') != 'admin':
-        return jsonify({'error': 'Forbidden'}), 403
-    users = User.query.order_by(User.id.asc()).all()
-    return jsonify([{'id': u.id, 'email': u.email, 'name': u.name, 'role': u.role} for u in users])
-
-@app.route('/users', methods=['POST'])
-@jwt_required()
-def create_user():
-    claims = get_jwt()
-    if claims.get('role') != 'admin':
-        return jsonify({'error': 'Forbidden'}), 403
-    data = request.json or {}
-    email = (data.get('email') or '').strip().lower()
-    if not email or not data.get('password'):
-        return jsonify({'error': 'email and password required'}), 400
-    if User.query.filter_by(email=email).first():
-        return jsonify({'error': 'email already exists'}), 400
-    user = User(email=email, name=data.get('name'), role=data.get('role', 'viewer'))
-    user.set_password(data['password'])
-    db.session.add(user)
-    db.session.commit()
-    return jsonify({'id': user.id, 'email': user.email, 'name': user.name, 'role': user.role}), 201
-
-@app.route('/users/<int:uid>', methods=['DELETE'])
-@jwt_required()
-def delete_user(uid):
-    claims = get_jwt()
-    if claims.get('role') != 'admin':
-        return jsonify({'error': 'Forbidden'}), 403
-    if int(get_jwt_identity()) == uid:
-        return jsonify({'error': "Can't delete yourself"}), 400
-    u = User.query.get(uid)
-    if not u:
-        return jsonify({'error': 'Not found'}), 404
-    db.session.delete(u)
-    db.session.commit()
-    return jsonify({'ok': True})
-
-# Admin: get single user
-@app.route('/users/<int:uid>', methods=['GET'])
-@jwt_required()
-def get_user(uid):
-    claims = get_jwt()
-    if claims.get('role') != 'admin':
-        return jsonify({'error': 'Forbidden'}), 403
-    u = User.query.get(uid)
-    if not u:
-        return jsonify({'error': 'Not found'}), 404
-    return jsonify({'id': u.id, 'email': u.email, 'name': u.name, 'role': u.role})
-
-# Admin: update single user
-@app.route('/users/<int:uid>', methods=['PATCH'])
-@jwt_required()
-def update_user(uid):
-    claims = get_jwt()
-    if claims.get('role') != 'admin':
-        return jsonify({'error': 'Forbidden'}), 403
-    u = User.query.get(uid)
-    if not u:
-        return jsonify({'error': 'Not found'}), 404
-    data = request.json or {}
-    if 'email' in data and data['email']:
-        new_email = data['email'].strip().lower()
-        if new_email != u.email and User.query.filter_by(email=new_email).first():
-            return jsonify({'error': 'email already exists'}), 400
-        u.email = new_email
-    if 'name' in data:
-        u.name = data['name']
-    if 'role' in data:
-        u.role = data['role']
-    if 'password' in data and data['password']:
-        u.set_password(data['password'])
-    db.session.commit()
-    return jsonify({'id': u.id, 'email': u.email, 'name': u.name, 'role': u.role})
-
-# Arrivals
-@app.route('/api/arrivals', methods=['GET'])
-def list_arrivals():
-    arrivals = Arrival.query.order_by(Arrival.created_at.desc()).all()
-    # Precompute file counts for all arrivals in one query (robust & fast)
-    counts_map = dict(
-        db.session.query(ArrivalFile.arrival_id, func.count(ArrivalFile.id))
-        .group_by(ArrivalFile.arrival_id)
-        .all()
-    )
-    results = []
-    for a in arrivals:
-        d = a.to_dict()
-        d["files_count"] = int(counts_map.get(a.id, 0))
-        results.append(d)
-    return jsonify(results)
-
-@app.route('/api/arrivals/<int:id>', methods=['GET'])
-def get_arrival(id):
-    a = Arrival.query.get_or_404(id)
-    d = a.to_dict()
-    d["files_count"] = db.session.query(func.count(ArrivalFile.id)).filter(ArrivalFile.arrival_id == a.id).scalar() or 0
-    return jsonify(d)
-
-@app.route('/api/arrivals/search', methods=['GET'])
-def search_arrivals():
-    try:
-        page = int(request.args.get('page', 1))
-        # accept both per_page and page_size (frontend sends per_page)
-        per_page_raw = request.args.get('per_page', request.args.get('page_size', 20))
-        per_page = int(per_page_raw)
-        page = max(1, page)
-        per_page = min(max(1, per_page), 100)
-    except ValueError:
-        return jsonify({'error': 'page/per_page must be integers'}), 400
-
-    status = request.args.get('status')
-    supplier = request.args.get('supplier')
-    q = request.args.get('q')
-    from_str = request.args.get('from')
-    to_str = request.args.get('to')
-    sort = request.args.get('sort', 'created_at')
-    order = request.args.get('order', 'desc').lower()
-
-    sort_field_map = {'created_at': Arrival.created_at, 'supplier': Arrival.supplier, 'status': Arrival.status}
-    sort_col = sort_field_map.get(sort, Arrival.created_at)
-    sort_expr = sort_col.desc() if order != 'asc' else sort_col.asc()
-    query = Arrival.query
-    if status:
-        query = query.filter(Arrival.status == status)
-    if supplier:
-        query = query.filter(Arrival.supplier.ilike(f"%{supplier}%"))
-    if q:
-        like = f"%{q}%"
-        query = query.filter(or_(Arrival.plate.ilike(like), Arrival.carrier.ilike(like)))
-
-    def parse_dt(val):
-        if not val:
-            return None
-        try:
-            return datetime.fromisoformat(val)
-        except Exception:
-            return None
-
-    from_dt = parse_dt(from_str)
-    to_dt = parse_dt(to_str)
-    if from_str and not from_dt:
-        return jsonify({'error': "Invalid 'from' ISO datetime"}), 400
-    if to_str and not to_dt:
-        return jsonify({'error': "Invalid 'to' ISO datetime"}), 400
-    if from_dt:
-        query = query.filter(Arrival.created_at >= from_dt)
-    if to_dt:
-        query = query.filter(Arrival.created_at <= to_dt)
-
-    total = query.count()
-    items = query.order_by(sort_expr).offset((page - 1) * per_page).limit(per_page).all()
-    item_ids = [a.id for a in items]
-    counts_map = {}
-    if item_ids:
-        counts_map = dict(
-            db.session.query(ArrivalFile.arrival_id, func.count(ArrivalFile.id))
-            .filter(ArrivalFile.arrival_id.in_(item_ids))
-            .group_by(ArrivalFile.arrival_id)
-            .all()
-        )
-    items_payload = []
-    for a in items:
-        d = a.to_dict()
-        d["files_count"] = int(counts_map.get(a.id, 0))
-        items_payload.append(d)
-    return jsonify({'page': page, 'per_page': per_page, 'total': total, 'items': items_payload})
-
-@app.route('/api/arrivals', methods=['POST'])
-def create_arrival():
-    data = request.json or {}
-    # --- Normalize aliases for location (frontend may send different keys) ---
-    loc = data.get('location')
-    if not loc:
-        for alias in ('lokacija', 'store', 'shop', 'warehouse'):
-            if alias in data and data.get(alias):
-                loc = data.get(alias)
-                break
-    if isinstance(loc, str):
-        loc = loc.strip()
-    attempted_fields = set(data.keys() or [])
-    ok, role, uid, err = check_api_or_jwt(attempted_fields)
-    if not ok:
-        return err
-    a = Arrival(
-        supplier=data.get('supplier'),
-        carrier=data.get('carrier'),
-        plate=data.get('plate'),
-        driver=data.get('driver'),
-        pickup_date=_parse_iso(data.get('pickup_date')),
-        type=data.get('type','truck'),
-        eta=data.get('eta'),
-        status=data.get('status','not_shipped'),
-        note=data.get('note'),
-        order_date=_parse_iso(data.get('order_date')),
-        production_due=_parse_iso(data.get('production_due')),
-        shipped_at=_parse_iso(data.get('shipped_at')),
-        arrived_at=_parse_iso(data.get('arrived_at')),
-        customs_info=data.get('customs_info'),
-        freight_cost=_parse_float(data.get('freight_cost')),
-        goods_cost=_parse_float(data.get('goods_cost')),
-        customs_cost=_parse_float(data.get('customs_cost')),
-        currency=(data.get('currency') or 'EUR')[:8],
-        responsible=data.get('responsible'),
-        location=loc,
-        assignee_id=data.get('assignee_id')
-    )
-    db.session.add(a); db.session.commit()
-    return jsonify(a.to_dict()), 201
-
-@app.route('/api/arrivals/<int:id>', methods=['PATCH'])
-def update_arrival(id):
-    a = Arrival.query.get_or_404(id)
-    data = request.json or {}
-
-    attempted_fields = set(data.keys() or [])
-    ok, role, uid, err = check_api_or_jwt(attempted_fields)
-    if not ok:
-        return err
-
-    # --- Normalize aliases for location and write back into data ---
-    if 'location' not in data or (isinstance(data.get('location'), str) and not data.get('location').strip()):
-        loc = None
-        for alias in ('lokacija', 'store', 'shop', 'warehouse'):
-            if alias in data and data.get(alias):
-                loc = data.get(alias)
-                break
-        if isinstance(loc, str):
-            loc = loc.strip()
-        if loc is not None:
-            data['location'] = loc
-
-    # If JWT (non-admin), restrict to editable fields for their role
-    editable = ROLE_FIELDS.get(role, set()) if role and role != 'system' else None
-    def can_set(field):
-        if role == 'admin' or role == 'system':
-            return True
-        return field in (editable or set())
-
-    # --- Field alias normalization (accept common frontend variants) ---
-    # transport_type -> type
-    if 'transport_type' in data and 'type' not in data and can_set('type'):
-        data['type'] = data.get('transport_type')
-    # assignee / assignee_name -> responsible (fallback if responsible not explicitly provided)
-    if 'responsible' not in data:
-        if 'assignee_name' in data and can_set('responsible'):
-            data['responsible'] = data.get('assignee_name')
-        elif 'assignee' in data and can_set('responsible'):
-            data['responsible'] = data.get('assignee')
-    # normalize empty strings for simple text fields so they persist consistently
-    for _k in ('responsible', 'location'):
-        if _k in data and isinstance(data[_k], str):
-            data[_k] = data[_k].strip()
-
-    for field in ['supplier','carrier','plate','driver','type','eta','status','note','customs_info','currency','assignee_id','responsible','location']:
-        if field in data and can_set(field):
-            setattr(a, field, data[field])
-    if 'order_date' in data and can_set('order_date'): a.order_date = _parse_iso(data.get('order_date'))
-    if 'production_due' in data and can_set('production_due'): a.production_due = _parse_iso(data.get('production_due'))
-    if 'shipped_at' in data and can_set('shipped_at'): a.shipped_at = _parse_iso(data.get('shipped_at'))
-    if 'arrived_at' in data and can_set('arrived_at'): a.arrived_at = _parse_iso(data.get('arrived_at'))
-    if 'freight_cost' in data and can_set('freight_cost'): a.freight_cost = _parse_float(data.get('freight_cost'))
-    if 'customs_cost' in data and can_set('customs_cost'): a.customs_cost = _parse_float(data.get('customs_cost'))
-    if 'pickup_date' in data and can_set('pickup_date'): a.pickup_date = _parse_iso(data.get('pickup_date'))
-    if 'goods_cost' in data and can_set('goods_cost'): a.goods_cost = _parse_float(data.get('goods_cost'))
-    db.session.commit()
-    return jsonify(a.to_dict())
-
-# Role/JWT update (frontend koristi ovo)
-@app.route('/api/arrivals/<int:id>/status', methods=['PATCH'])
-@jwt_required()
-def update_arrival_status(id):
-    a = Arrival.query.get_or_404(id)
-    claims = get_jwt()
-    uid = get_jwt_identity()
-    role = claims.get('role','viewer')
-    user_id = int(uid) if uid is not None else None
-    data = request.json or {}
-
-    attempted_fields = set(data.keys())
-    if 'status' in data and data['status'] not in ALLOWED_STATUSES:
-        return jsonify({'error': 'Invalid status'}), 400
-    if not can_edit(role, attempted_fields):
-        return jsonify({'error': 'Forbidden for your role'}), 403
-
-    editable = ROLE_FIELDS.get(role, set()) | (ROLE_FIELDS.get('admin') if role == 'admin' else set())
-    for field in attempted_fields & editable:
-        if field in {'order_date','production_due','shipped_at','arrived_at'}:
-            setattr(a, field, _parse_iso(data[field]))
-        elif field in {'freight_cost','customs_cost'}:
-            setattr(a, field, _parse_float(data[field]))
-        else:
-            setattr(a, field, data[field])
-
-    # activity
-    if 'status' in data:
-        msg = f"Status changed to '{data['status']}'"
-        db.session.add(ArrivalUpdate(arrival_id=a.id, user_id=user_id, message=msg))
-        if NOTIFY_ON_STATUS:
-            try:
-                send_email(
-                    subject=f"[Arrivals] #{a.id} status → {data['status']}",
-                    body=f"Supplier: {a.supplier}\nPlate: {a.plate or '-'}\nNew status: {data['status']}\nBy: {claims.get('email')}"
-                    , to_list=all_user_emails()
-                )
-            except Exception as e:
-                print("[STATUS MAIL ERROR]", e)
-
-    db.session.commit()
-    return jsonify(a.to_dict())
-
-@app.route('/api/arrivals/<int:id>', methods=['DELETE'])
-@jwt_required(optional=True)
-def delete_arrival(id):
-    # Allow admin via JWT or system via X-API-Key
-    if not (has_valid_api_key()):
-        try:
-            verify_jwt_in_request(optional=False)
-        except Exception:
-            return jsonify({'error': 'Unauthorized'}), 401
-        claims = get_jwt()
-        if (claims or {}).get('role') != 'admin':
-            return jsonify({'error': 'Admin only'}), 403
-
-    a = Arrival.query.get(id)
-    if not a:
-        return jsonify({'error': 'Not found'}), 404
-    # Remove all files from disk for this arrival
-    try:
-        for f in list(getattr(a, "files", []) or []):
-            try:
-                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], f.filename))
-            except Exception:
-                # ignore per-file deletion errors
-                pass
-    except Exception:
-        pass
-    db.session.delete(a)
-    db.session.commit()
-    return jsonify({'ok': True, 'deleted_id': id}), 200
-
-# Bulk delete arrivals endpoint
-@app.route('/api/arrivals/bulk_delete', methods=['DELETE'])
-@jwt_required(optional=True)
-def bulk_delete_arrivals():
-    payload = request.json or {}
-    ids = payload.get('ids') or []
-    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
-        return jsonify({'error': 'ids must be an array of integers'}), 400
-
-    # Allow admin via JWT or system via API key
-    if not (has_valid_api_key()):
-        try:
-            verify_jwt_in_request(optional=False)
-        except Exception:
-            return jsonify({'error': 'Unauthorized'}), 401
-        claims = get_jwt()
-        if (claims or {}).get('role') != 'admin':
-            return jsonify({'error': 'Admin only'}), 403
-
-    if not ids:
-        return jsonify({'ok': True, 'deleted': []})
-
-    # Remove all related files from disk for these arrivals
-    try:
-        file_rows = db.session.query(ArrivalFile.filename).filter(ArrivalFile.arrival_id.in_(ids)).all()
-        for (fname,) in file_rows:
-            try:
-                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], fname))
-            except Exception:
-                # ignore per-file deletion errors
-                pass
-    except Exception:
-        pass
-
-    db.session.query(Arrival).filter(Arrival.id.in_(ids)).delete(synchronize_session=False)
-    db.session.commit()
-    return jsonify({'ok': True, 'deleted': ids}), 200
-
-# Alternate bulk delete via querystring: DELETE /api/arrivals?ids=1,2,3
-@app.route('/api/arrivals', methods=['DELETE'])
-@jwt_required(optional=True)
-def delete_arrivals_querystring():
-    # Get ids from querystring or JSON body
-    qs_ids = request.args.get('ids')
-    body = request.get_json(silent=True) or {}
-    body_ids = body.get('ids') if isinstance(body, dict) else []
-
-    ids = []
-    if qs_ids:
-        try:
-            ids.extend([int(x) for x in qs_ids.split(',') if x.strip()])
-        except Exception:
-            return jsonify({'error': 'ids in querystring must be comma-separated integers'}), 400
-    if isinstance(body_ids, list):
-        try:
-            ids.extend([int(x) for x in body_ids])
-        except Exception:
-            return jsonify({'error': 'ids in JSON must be integers'}), 400
-
-    # De-duplicate
-    ids = list(sorted(set(ids)))
-
-    # Authorization: allow admin via JWT or system via X-API-Key
-    if not (has_valid_api_key()):
-        try:
-            verify_jwt_in_request(optional=False)
-        except Exception:
-            return jsonify({'error': 'Unauthorized'}), 401
-        claims = get_jwt()
-        if (claims or {}).get('role') != 'admin':
-            return jsonify({'error': 'Admin only'}), 403
-
-    if not ids:
-        return jsonify({'ok': True, 'deleted': []})
-
-    # Remove all related files from disk for these arrivals
-    try:
-        file_rows = db.session.query(ArrivalFile.filename).filter(ArrivalFile.arrival_id.in_(ids)).all()
-        for (fname,) in file_rows:
-            try:
-                os.remove(os.path.join(app.config['UPLOAD_FOLDER'], fname))
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    db.session.query(Arrival).filter(Arrival.id.in_(ids)).delete(synchronize_session=False)
-    db.session.commit()
-    return jsonify({'ok': True, 'deleted': ids}), 200
-
-# Updates
-@app.route('/api/arrivals/<int:arrival_id>/updates', methods=['GET'])
-@jwt_required(optional=True)
-def list_updates(arrival_id):
-    updates = ArrivalUpdate.query.filter_by(arrival_id=arrival_id).order_by(ArrivalUpdate.created_at.asc()).all()
-    return jsonify([{'id': u.id, 'arrival_id': u.arrival_id, 'user_id': u.user_id, 'message': u.message, 'created_at': u.created_at.isoformat()} for u in updates])
-
-@app.route('/api/arrivals/<int:arrival_id>/updates', methods=['POST'])
-@jwt_required()
-def create_update(arrival_id):
-    Arrival.query.get_or_404(arrival_id)
-    uid = get_jwt_identity()
-    msg = (request.json or {}).get('message','').strip()
-    if not msg: return jsonify({'error': 'message required'}), 400
-    upd = ArrivalUpdate(arrival_id=arrival_id, user_id=int(uid) if uid else None, message=msg)
-    db.session.add(upd); db.session.commit()
-    return jsonify({'id': upd.id, 'arrival_id': upd.arrival_id, 'user_id': upd.user_id, 'message': upd.message, 'created_at': upd.created_at.isoformat()}), 201
-
-# Files
-@app.route('/api/arrivals/<int:arrival_id>/files', methods=['POST'])
-@jwt_required()
-def upload_file(arrival_id):
-    Arrival.query.get_or_404(arrival_id)
-
-    # Collect files from both 'files' (multiple) and 'file' (single)
-    files = []
-    if 'files' in request.files:
-        files.extend(request.files.getlist('files'))
-    if 'file' in request.files:
-        files.append(request.files['file'])
-
-    if not files:
-        return jsonify({'error': 'file/files missing'}), 400
-
-    recs = []
-    for f in files:
-        if not f or f.filename == '':
-            continue
-        safe_name = secure_filename(f.filename)
-        unique_name = f"{int(time.time()*1000)}_{safe_name}"
-        path = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
-        f.save(path)
-        rec = ArrivalFile(arrival_id=arrival_id, filename=unique_name, original_name=safe_name)
-        db.session.add(rec)
-        db.session.flush()  # get IDs without full commit
-        recs.append({
-            'id': rec.id,
-            'arrival_id': rec.arrival_id,
-            'filename': rec.filename,
-            'original_name': rec.original_name,
-            'uploaded_at': (rec.uploaded_at or datetime.utcnow()).isoformat(),
-            'url': f"/files/{rec.filename}",
-        })
-    db.session.commit()
-    return jsonify(recs), 201
-
-# List files for an arrival
-@app.route('/api/arrivals/<int:arrival_id>/files', methods=['GET'])
-@jwt_required(optional=True)
-def list_files(arrival_id):
-    Arrival.query.get_or_404(arrival_id)
-    files = ArrivalFile.query.filter_by(arrival_id=arrival_id).order_by(ArrivalFile.uploaded_at.asc()).all()
-    return jsonify([
-        {
-            'id': f.id,
-            'arrival_id': f.arrival_id,
-            'filename': f.filename,
-            'original_name': f.original_name,
-            'uploaded_at': f.uploaded_at.isoformat(),
-            'url': f"/files/{f.filename}",
-        } for f in files
-    ])
-
-
-# Delete a file (admin or API key)
-@app.route('/api/arrivals/<int:arrival_id>/files/<int:file_id>', methods=['DELETE'])
-@jwt_required(optional=True)
-def delete_file(arrival_id, file_id):
-    # Admin via JWT or system via API key
-    if not (has_valid_api_key()):
-        try:
-            verify_jwt_in_request(optional=False)
-        except Exception:
-            return jsonify({'error': 'Unauthorized'}), 401
-        claims = get_jwt()
-        if (claims or {}).get('role') != 'admin':
-            return jsonify({'error': 'Admin only'}), 403
-    rec = ArrivalFile.query.filter_by(id=file_id, arrival_id=arrival_id).first()
-    if not rec:
-        return jsonify({'error': 'Not found'}), 404
-    # Try delete file from disk
-    try:
-        os.remove(os.path.join(app.config['UPLOAD_FOLDER'], rec.filename))
-    except Exception:
-        pass
-    db.session.delete(rec)
-    db.session.commit()
-    return jsonify({'ok': True, 'deleted_id': file_id})
-
-# Container Files
-@app.route('/api/containers/<int:cid>/files', methods=['POST'])
-@jwt_required()
-def upload_container_file(cid):
-    # Ensure container exists
-    Container.query.get_or_404(cid)
-
-    # Collect files from both 'files' (multiple) and 'file' (single)
-    files = []
-    if 'files' in request.files:
-        files.extend(request.files.getlist('files'))
-    if 'file' in request.files:
-        files.append(request.files['file'])
-
-    if not files:
-        return jsonify({'error': 'file/files missing'}), 400
-
-    recs = []
-    for f in files:
-        if not f or f.filename == '':
-            continue
-        safe_name = secure_filename(f.filename)
-        unique_name = f"{int(time.time()*1000)}_{safe_name}"
-        path = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
-        f.save(path)
-        rec = ContainerFile(container_id=cid, filename=unique_name, original_name=safe_name)
-        db.session.add(rec)
-        db.session.flush()
-        recs.append({
-            'id': rec.id,
-            'container_id': rec.container_id,
-            'filename': rec.filename,
-            'original_name': rec.original_name,
-            'uploaded_at': (rec.uploaded_at or datetime.utcnow()).isoformat(),
-            'url': f"/files/{rec.filename}",
-        })
-    db.session.commit()
-    return jsonify(recs), 201
-
-@app.route('/api/containers/<int:cid>/files', methods=['GET'])
-@jwt_required(optional=True)
-def list_container_files(cid):
-    Container.query.get_or_404(cid)
-    files = ContainerFile.query.filter_by(container_id=cid).order_by(ContainerFile.uploaded_at.asc()).all()
-    return jsonify([
-        {
-            'id': f.id,
-            'container_id': f.container_id,
-            'filename': f.filename,
-            'original_name': f.original_name,
-            'uploaded_at': f.uploaded_at.isoformat(),
-            'url': f"/files/{f.filename}",
-        } for f in files
-    ])
-
-@app.route('/api/containers/<int:cid>/files/<int:file_id>', methods=['DELETE'])
-@jwt_required(optional=True)
-def delete_container_file(cid, file_id):
-    # Admin via JWT or system via API key
-    if not (has_valid_api_key()):
-        try:
-            verify_jwt_in_request(optional=False)
-        except Exception:
-            return jsonify({'error': 'Unauthorized'}), 401
-        claims = get_jwt()
-        if (claims or {}).get('role') != 'admin':
-            return jsonify({'error': 'Admin only'}), 403
-
-    rec = ContainerFile.query.filter_by(id=file_id, container_id=cid).first()
-    if not rec:
-        return jsonify({'error': 'Not found'}), 404
-
-    # Try delete file from disk
-    try:
-        os.remove(os.path.join(app.config['UPLOAD_FOLDER'], rec.filename))
-    except Exception:
-        pass
-
-    db.session.delete(rec)
-    db.session.commit()
-    return jsonify({'ok': True, 'deleted_id': file_id})
-
-@app.route('/files/<path:filename>', methods=['GET', 'HEAD', 'OPTIONS'])
-def get_file(filename):
-    # CORS preflight
-    if request.method == 'OPTIONS':
-        origin = request.headers.get("Origin")
-        headers = {}
-        if origin in (ALLOWED_ORIGINS or []):
-            headers["Access-Control-Allow-Origin"] = origin
-            headers["Vary"] = "Origin"
-            headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
-            headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-        return ("", 204, headers)
-
-    # Support both `?download=1` and `?inline=1` toggles
-    download_q = (request.args.get('download') or '').strip().lower()
-    inline_q = (request.args.get('inline') or '').strip().lower()
-    # Default to inline preview; allow `?download=1` to force download
-    as_att = download_q in ('1', 'true', 'yes', 'on') and not (inline_q in ('1','true','yes','on'))
-
-    try:
-        resp = send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=as_att)
-        # Ensure credentials-safe CORS headers (avoid wildcard when cookies are used)
-        origin = request.headers.get("Origin")
-        if origin in (ALLOWED_ORIGINS or []):
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            # Merge with existing Vary header if present
-            if resp.headers.get("Vary"):
-                if "Origin" not in resp.headers.get("Vary"):
-                    resp.headers["Vary"] = resp.headers.get("Vary") + ", Origin"
-            else:
-                resp.headers["Vary"] = "Origin"
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
-            resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
-        return resp
-    except FileNotFoundError:
-        return jsonify({'error': 'Not found'}), 404
-
-
-# Legacy/compatibility route for accidental double /files/files/ URLs
-@app.route('/files/files/<path:filename>', methods=['GET', 'HEAD', 'OPTIONS'])
-def get_file_compat(filename):
-    # Delegate to the canonical handler
-    return get_file(filename)
-
-# Containers CRUD + search
-@app.get('/api/containers')
-@jwt_required(optional=True)
-def containers_list():
-    q = (request.args.get('q') or '').strip().lower()
-    status = (request.args.get('status') or 'all').lower()  # all | paid | unpaid
-
-    query = Container.query
-    if q:
-        like = f"%{q}%"
-        query = query.filter(or_(
-            Container.supplier.ilike(like),
-            Container.proforma_no.ilike(like),
-            Container.cargo.ilike(like),
-            Container.container_no.ilike(like),
-            Container.roba.ilike(like),
-            Container.agent.ilike(like),
-        ))
-
-    if status == 'paid':
-        query = query.filter(Container.paid.is_(True))
-    elif status == 'unpaid':
-        query = query.filter(Container.paid.is_(False))
-
-    rows = query.order_by(Container.created_at.desc()).all()
-    return jsonify([r.to_dict() for r in rows])
-
-
-@app.post('/api/containers')
-@jwt_required()
-def containers_create():
-    data = request.get_json(force=True) or {}
-    r = Container(
-        supplier=data.get('supplier', ''),
-        proforma_no=data.get('proformaNo', ''),
-        etd=_parse_date_any(data.get('etd')),
-        delivery=_parse_date_any(data.get('delivery')),
-        eta=_parse_date_any(data.get('eta')),
-        cargo_qty=data.get('cargoQty', ''),
-        cargo=data.get('cargo', ''),
-        container_no=data.get('containerNo', ''),
-        roba=data.get('roba', ''),
-        contain_price=data.get('containPrice', ''),
-        agent=data.get('agent', ''),
-        total=data.get('total', ''),
-        deposit=data.get('deposit', ''),
-        balance=data.get('balance', ''),
-        paid=bool(data.get('placeno', False) if _parse_boolish(data.get('placeno', False)) is not None else _parse_boolish(
-            data.get('paid')
-            or data.get('is_paid')
-            or data.get('payment_status')
-            or data.get('status')
-        ) or False),
-    )
-
-    # server-side BALANCE recompute
-    T = _money_to_number(r.total)
-    D = _money_to_number(r.deposit)
-    paid_flag = bool(r.paid)
-    if paid_flag:
-        # If paid on creation, force balance to 0.00
-        r.balance = "0.00"
-    elif T is not None and D is not None:
-        bal = round(T - D, 2)
-        r.balance = f"{bal:.2f}"
-    # NOTE: do NOT auto-set r.paid based purely on balance; user controls it via 'placeno/paid'.
-
-    db.session.add(r)
-    db.session.commit()
-
-    # notify if newly created row is paid (e.g., total == deposit or manual)
-    try:
-        if NOTIFY_ON_PAID:
-            new_row = r.to_dict()
-            # Simulate previous state as unpaid to trigger transition
-            old_row = dict(new_row)
-            old_row["placeno"] = False
-            maybe_notify_paid(old_row, new_row, recipients=(MAIL_DEFAULT_TO or all_user_emails()))
-    except Exception as _notify_err:
-        print("[MAIL notify_paid (create) ERROR]", _notify_err)
-
-    return jsonify(r.to_dict()), 201
-
-
-@app.patch('/api/containers/<int:cid>')
-@jwt_required()
-def containers_update(cid):
-    r = Container.query.get_or_404(cid)
-    data = request.get_json(force=True) or {}
-    # snapshot prije izmjena (za detekciju prelaza neplaćeno -> plaćeno)
-    try:
-        old_row = r.to_dict()
-    except Exception:
-        old_row = None
-
-    # basic fields
-    mapping = {
-        "supplier": "supplier",
-        "proformaNo": "proforma_no",
-        "cargoQty": "cargo_qty",
-        "cargo": "cargo",
-        "containerNo": "container_no",
-        "roba": "roba",
-        "containPrice": "contain_price",
-        "agent": "agent",
-        "total": "total",
-        "deposit": "deposit",
-        "balance": "balance",
-    }
-    for k, attr in mapping.items():
-        if k in data:
-            setattr(r, attr, data.get(k) or "")
-
-    # dates
-    if "etd" in data:
-        r.etd = _parse_date_any(data.get("etd"))
-    if "delivery" in data:
-        r.delivery = _parse_date_any(data.get("delivery"))
-    if "eta" in data:
-        r.eta = _parse_date_any(data.get("eta"))
-
-    # manual paid toggle (alias-aware)
-    paid_in = None
-    if "placeno" in data:
-        paid_in = _parse_boolish(data.get("placeno"))
-    else:
-        for k in ("paid", "is_paid", "payment_status", "status"):
-            if k in data:
-                paid_in = _parse_boolish(data.get(k))
-                break
-    if paid_in is not None:
-        r.paid = bool(paid_in)
-
-    # server-side recompute balance with paid awareness
-    T = _money_to_number(r.total)
-    D = _money_to_number(r.deposit)
-    if bool(r.paid):
-        # When paid, keep balance at 0.00 regardless of T/D
-        r.balance = "0.00"
-    else:
-        if T is not None and D is not None:
-            bal = round(T - D, 2)
-            r.balance = f"{bal:.2f}"
-        # if we can't compute (missing numbers), leave as-is string
-    # NOTE: do NOT auto-set r.paid based on balance; user controls "placeno/paid" manually.
-
-    db.session.commit()
-    # nakon upisa – provjeri da li je došlo do prelaza na plaćeno i pošalji mail
-    if NOTIFY_ON_PAID:
-        try:
-            new_row = r.to_dict()
-            if old_row is not None:
-                maybe_notify_paid(old_row, new_row, recipients=(MAIL_DEFAULT_TO or all_user_emails()))
-        except Exception as _notify_err:
-            # ne ruši request ako mail ne prođe
-            print("[MAIL notify_paid (update) ERROR]", _notify_err)
-    return jsonify(r.to_dict())
-
-
-
-@app.delete('/api/containers/<int:cid>')
-@jwt_required()
-def containers_delete(cid):
-    r = Container.query.get_or_404(cid)
-    db.session.delete(r)
-    db.session.commit()
-    return jsonify({"ok": True, "deleted_id": cid})
 
 
 # Import containers from Excel/CSV
@@ -1558,21 +719,16 @@ def options_responsibles():
         vals = ["Ludvig", "Gazi", "Gezim", "Armir"]
     return jsonify(vals)
 
-@app.get('/api/options/locations')
-def options_locations():
+def _compute_locations_list():
     """
-    Returns the list of allowed shop/warehouse locations for dropdowns.
-    Priority:
-      1) LOCATIONS env var (comma-separated) if present.
-      2) Fixed list provided by the business.
-      3) Any additional distinct, non-empty locations already present in DB (appended).
+    1) LOCATIONS iz .env (comma-separated) ako postoji,
+    2) default poslovna lista (fiksna),
+    3) distinct vrijednosti iz Arrival.location (append + dedupe).
     """
-    # 1) Environment override
     from_env = (os.environ.get('LOCATIONS') or '').strip()
     if from_env:
         base_list = [v.strip() for v in from_env.split(',') if v.strip()]
     else:
-        # 2) Fixed list from the user (trimmed, order preserved)
         base_list = [
             "Veleprodajni magaci",
             "Pg Centar",
@@ -1587,24 +743,33 @@ def options_locations():
             "Bijelo polje",
             "Ulcinj Centar",
         ]
-
-    # 3) Union with distinct locations already stored in the DB
     try:
         rows = db.session.query(Arrival.location).filter(Arrival.location.isnot(None)).all()
         extra = [(r[0] or '').strip() for r in rows if (r[0] or '').strip()]
     except Exception:
         extra = []
-
-    # Deduplicate while preserving order: base_list first, then extras not already present
-    seen = set()
-    result = []
+    seen, result = set(), []
     for v in base_list + extra:
         k = v.strip()
         if k and k not in seen:
             seen.add(k)
             result.append(k)
+    return result
 
-    return jsonify(result)
+@app.route('/api/locations', methods=['GET', 'HEAD', 'OPTIONS'])
+def api_locations():
+    # CORS preflight
+    if request.method == 'OPTIONS':
+        return ("", 204)
+    return jsonify(_compute_locations_list()), 200
+
+@app.get('/api/options/locations')
+def options_locations():
+    """
+    Returns the list of allowed shop/warehouse locations for dropdowns.
+    Reuses the canonical computation used by /api/locations.
+    """
+    return jsonify(_compute_locations_list())
 
 def _parse_boolish(val):
     """
@@ -1730,18 +895,34 @@ def _money_to_number(val):
     except Exception:
         return None
 
-# --- Admin seed ---
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD')
 ADMIN_NAME = os.environ.get('ADMIN_NAME', 'Admin')
 
 def ensure_admin():
-    if not ADMIN_EMAIL or not ADMIN_PASSWORD: return
+    if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+        return
     email = ADMIN_EMAIL.strip().lower()
-    if not User.query.filter_by(email=email).first():
-        u = User(email=email, name=ADMIN_NAME, role='admin')
+    existing = User.query.filter_by(email=email).first()
+    if existing:
+        return
+    u = User(email=email, name=ADMIN_NAME, role='admin')
+    # podrži obje varijante modela:
+    # - hashed preko set_password()
+    # - plain polje "password"
+    # - legacy hash polje "password_hash"
+    if hasattr(u, "set_password") and callable(getattr(u, "set_password")):
         u.set_password(ADMIN_PASSWORD)
-        db.session.add(u); db.session.commit()
+    elif hasattr(u, "password"):
+        setattr(u, "password", ADMIN_PASSWORD)
+    else:
+        try:
+            u.password_hash = generate_password_hash(ADMIN_PASSWORD)
+        except Exception:
+            pass
+    db.session.add(u)
+    db.session.commit()
+    print(f"[SEED] Admin user created: {email}")
 
 # --- Soft migrations for SQLite ---
 def column_exists(table, column):
@@ -1785,12 +966,16 @@ def sla_monitor_loop():
         try:
             with app.app_context():
                 now = datetime.utcnow()
-                pending = Arrival.query.filter(
+                # Build base query
+                query = Arrival.query.filter(
                     Arrival.production_due.isnot(None),
                     Arrival.production_due < now,
-                    Arrival.status.in_(['ordered','in_production']),
-                    (Arrival.production_overdue_notified.is_(False))
-                ).all()
+                    Arrival.status.in_(['ordered','in_production'])
+                )
+                # Guard for deployments where the column doesn't exist
+                if hasattr(Arrival, 'production_overdue_notified'):
+                    query = query.filter(Arrival.production_overdue_notified.is_(False))
+                pending = query.all()
                 if pending and NOTIFY_ON_SLA:
                     for a in pending:
                         try:
@@ -1799,7 +984,8 @@ def sla_monitor_loop():
                                 body=f"Supplier: {a.supplier}\nDue: {a.production_due}\nStatus: {a.status}\nPlease contact manufacturer.",
                                 to_list=all_user_emails()
                             )
-                            a.production_overdue_notified = True
+                            if hasattr(a, 'production_overdue_notified'):
+                                a.production_overdue_notified = True
                         except Exception as e:
                             print("[SLA MAIL ERROR]", e)
                     db.session.commit()
@@ -1807,16 +993,202 @@ def sla_monitor_loop():
             print("[SLA LOOP ERROR]", e)
         time.sleep(SLA_CHECK_SECONDS)
 
+# --- Blueprints (deferred registration after helpers to avoid circular imports) ---
+
+def _register_blueprint(module_candidates, attr_name="bp", fallback_url_prefix=None, label=""):
+    """
+    Try importing a blueprint object from a list of module paths and register it.
+    Example:
+      _register_blueprint(["routes.auth", "auth"], label="auth")
+    """
+    for mod in module_candidates:
+        try:
+            mod_obj = __import__(mod, fromlist=[attr_name])
+            bp_obj = getattr(mod_obj, attr_name, None)
+            if bp_obj is None:
+                raise AttributeError(f"Module '{mod}' has no attr '{attr_name}'")
+            # Optionally override url_prefix if provided
+            if fallback_url_prefix:
+                app.register_blueprint(bp_obj, url_prefix=fallback_url_prefix)
+            else:
+                app.register_blueprint(bp_obj)
+            print(f"[BOOT] registered blueprint '{label or mod}' from {mod}")
+            return True
+        except Exception as e:
+            print(f"[BOOT] blueprint '{label or mod}' not registered from {mod}: {e}")
+            continue
+    print(f"[BOOT] blueprint '{label or module_candidates}' could not be registered from any candidate.")
+    return False
+
+# Auth blueprint: try new path first (routes.auth), then legacy (auth)
+_register_blueprint(["routes.auth", "auth"], label="auth")
+
+# Users blueprint
+_register_blueprint(["routes.users", "users"], label="users")
+
+# Arrivals blueprint
+_register_blueprint(["routes.arrivals", "arrivals"], label="arrivals")
+
+# Containers blueprint
+# The 'containers' blueprint in containers.py already defines url_prefix='/api/containers'.
+# Register without forcing an extra prefix to avoid '/api/containers/api/containers'.
+_register_blueprint(["routes.containers", "containers"], label="containers")
+
+
+# Files blueprint
+_register_blueprint(["routes.files", "files"], label="files")
+
+# --- Debug: list all routes (helps verify that PATCH endpoints are registered) ---
+@app.get('/_debug/routes')
+def _debug_routes():
+    out = []
+    try:
+        for r in app.url_map.iter_rules():
+            methods = ",".join(sorted(m for m in r.methods if m not in ("HEAD", "OPTIONS")))
+            out.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
+    except Exception as e:
+        return jsonify({"error": "route-introspection-failed", "detail": str(e)}), 500
+    return jsonify(out), 200
+
+# --- Admin: DB info (alembic revision) ---
+@app.route('/admin/db-info', methods=['GET', 'HEAD', 'OPTIONS'], strict_slashes=False)
+@jwt_required(optional=True)
+def admin_db_info():
+    if request.method == 'OPTIONS':
+        origin = request.headers.get("Origin")
+        headers = {}
+        if origin in (ALLOWED_ORIGINS or []):
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+            headers["Access-Control-Allow-Credentials"] = "true"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+        return ("", 204, headers)
+    # Allow API key or admin JWT only
+    if not has_valid_api_key():
+        try:
+            verify_jwt_in_request(optional=False)
+        except Exception:
+            return jsonify({"error": "Unauthorized"}), 401
+        claims = get_jwt() or {}
+        if claims.get('role') != 'admin':
+            return jsonify({"error": "Admin only"}), 403
+
+    info = {"db_revision": None, "repo_heads": [], "is_at_head": None}
+    # Read DB's current alembic revision
+    try:
+        row = db.session.execute(text("SELECT version_num FROM alembic_version"))
+        row = row.first()
+        if row:
+            info["db_revision"] = row[0]
+    except Exception as e:
+        info["db_error"] = str(e)
+
+    # Read repo heads via alembic config (best effort)
+    try:
+        from alembic.config import Config as _AConfig
+        from alembic.script import ScriptDirectory as _AScript
+        cfg_path = os.path.join(os.path.dirname(__file__), 'alembic.ini')
+        acfg = _AConfig(cfg_path)
+        script = _AScript.from_config(acfg)
+        heads = list(script.get_heads())
+        info["repo_heads"] = heads
+        if info["db_revision"] is not None:
+            info["is_at_head"] = info["db_revision"] in heads
+    except Exception as e:
+        info["repo_error"] = str(e)
+
+    return jsonify(info), 200
+
+# --- Fallback AUTH routes (only if the auth blueprint failed to register) ---
+def _has_endpoint(name: str) -> bool:
+    try:
+        return name in app.view_functions
+    except Exception:
+        return False
+
+# If nothing registered a handler for /auth/login, provide a minimal working fallback.
+if not (_has_endpoint("auth.login") or _has_endpoint("login") or _has_endpoint("auth_login_fallback")):
+    @app.route('/auth/login', methods=['POST'])
+    def auth_login_fallback():
+        try:
+            data = request.get_json(force=True, silent=True) or {}
+            email = (data.get('email') or '').strip().lower()
+            password = (data.get('password') or '')
+            if not email or not password:
+                return jsonify({'error': 'Email and password required'}), 400
+
+            user = User.query.filter_by(email=email).first()
+            if not user:
+                return jsonify({'error': 'Invalid credentials'}), 401
+
+            # Support both password_hash/check_password and plain password field
+            ok = False
+            if hasattr(user, "check_password") and callable(getattr(user, "check_password")):
+                ok = user.check_password(password)
+            elif hasattr(user, "password_hash"):
+                try:
+                    ok = check_password_hash(user.password_hash, password)
+                except Exception:
+                    ok = False
+            elif hasattr(user, "password"):
+                ok = (getattr(user, "password") == password)
+
+            if not ok:
+                return jsonify({'error': 'Invalid credentials'}), 401
+
+            claims = {'role': getattr(user, "role", "viewer"), 'email': user.email}
+            token = create_access_token(identity=str(getattr(user, "id", 0)), additional_claims=claims)
+            return jsonify({'access_token': token, 'user': {'id': getattr(user, "id", 0), 'email': user.email, 'role': getattr(user, "role", "viewer"), 'name': getattr(user, "name", "")}}), 200
+        except Exception as e:
+            return jsonify({'error': 'Login failed', 'detail': str(e)}), 500
+
+# If nothing registered a handler for /auth/me, provide a minimal working fallback.
+if not (_has_endpoint("auth.me") or _has_endpoint("me") or _has_endpoint("auth_me_fallback")):
+    @app.route('/auth/me', methods=['GET'])
+    @jwt_required()
+    def auth_me_fallback():
+        try:
+            uid = get_jwt_identity()
+            claims = get_jwt() or {}
+            email = claims.get('email')
+            role = claims.get('role', 'viewer')
+            user = None
+            if uid:
+                try:
+                    user = User.query.get(int(uid))
+                except Exception:
+                    user = None
+            return jsonify({
+                'id': int(uid) if uid else None,
+                'email': email or (user.email if user else None),
+                'role': role,
+                'name': (user.name if user and hasattr(user, "name") else None),
+            }), 200
+        except Exception as e:
+            return jsonify({'error': 'Auth check failed', 'detail': str(e)}), 401
+
 # --- App bootstrap ---
-with app.app_context():
-    db.create_all()
-    soft_migrate()
-    ensure_admin()
-    # start SLA thread (avoid double-run in reloader; debug is off anyway)
-    t = threading.Thread(target=sla_monitor_loop, daemon=True)
-    t.start()
+if os.environ.get("ALEMBIC_SKIP_BOOTSTRAP") != "1":
+    with app.app_context():
+        # Dev/first-run convenience: ensure tables exist. In production prefer Alembic.
+        try:
+            db.create_all()
+            print("[BOOTSTRAP] db.create_all() completed")
+        except Exception as e:
+            print("[BOOTSTRAP ERROR] create_all failed:", e)
+        # Seed admin if missing
+        try:
+            ensure_admin()
+        except Exception as e:
+            print("[BOOTSTRAP ERROR]", e)
+        # start SLA thread
+        t = threading.Thread(target=sla_monitor_loop, daemon=True)
+        t.start()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8081))
     debug = os.environ.get('FLASK_DEBUG', '0') == '1'
     app.run(host='0.0.0.0', port=port, debug=debug)
+
+    

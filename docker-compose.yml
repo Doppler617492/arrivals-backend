@@ -1,4 +1,3 @@
-version: "3.9"
 
 services:
   backend:  # Production-like (Gunicorn)
@@ -12,9 +11,17 @@ services:
     restart: unless-stopped
     container_name: arrivals-backend
     command: gunicorn -w 3 -k gthread -b 0.0.0.0:5000 app:app
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       - TZ=Europe/Podgorica
       - MAIL_DEBUG=0
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://arrivals:supersecretchangeit@db:5432/arrivals}
+      - UPLOAD_DIR=/app/uploads
+      - API_KEY=devkey123
+    volumes:
+      - ./uploads:/app/uploads
 
   backend-dev:  # Hot-reload dev server
     build:
@@ -29,6 +36,9 @@ services:
     restart: unless-stopped
     container_name: arrivals-backend-dev
     command: flask run --host=0.0.0.0 --port=5000
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       - FLASK_APP=app.py
       - FLASK_ENV=development
@@ -36,3 +46,25 @@ services:
       - PYTHONUNBUFFERED=1
       - TZ=Europe/Podgorica
       - MAIL_DEBUG=0
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://arrivals:supersecretchangeit@db:5432/arrivals}
+      - UPLOAD_DIR=/app/uploads
+
+  db:
+    image: postgres:16-alpine
+    container_name: arrivals-postgres
+    environment:
+      POSTGRES_DB: arrivals
+      POSTGRES_USER: arrivals
+      POSTGRES_PASSWORD: supersecretchangeit
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arrivals -d arrivals"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
