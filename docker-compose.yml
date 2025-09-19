@@ -1,16 +1,17 @@
 
 services:
-  backend:  # Production-like (Gunicorn)
+  backend:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8081:5000"
+      - "8081:8081"
     env_file:
       - .env  # optional; if you have DB URL, CORS origins, etc.
     restart: unless-stopped
     container_name: arrivals-backend
-    command: gunicorn -w 3 -k gthread -b 0.0.0.0:5000 app:app
+    # WebSocket-capable worker on 8081
+    command: gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 2 --timeout 90 -b 0.0.0.0:8081 app:app
     depends_on:
       db:
         condition: service_healthy
@@ -20,34 +21,10 @@ services:
       - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://arrivals:supersecretchangeit@db:5432/arrivals}
       - UPLOAD_DIR=/app/uploads
       - API_KEY=devkey123
+      - ALLOWED_ORIGINS=http://localhost:5173
+      - LOG_HTTP=1
     volumes:
       - ./uploads:/app/uploads
-
-  backend-dev:  # Hot-reload dev server
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
-    ports:
-      - "8082:5000"   # dev on 8082 to avoid clashing with prod and easy to remember next to 8081
-    volumes:
-      - .:/app        # live code mount
-    env_file:
-      - .env          # optional
-    restart: unless-stopped
-    container_name: arrivals-backend-dev
-    command: flask run --host=0.0.0.0 --port=5000
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      - FLASK_APP=app.py
-      - FLASK_ENV=development
-      - PYTHONDONTWRITEBYTECODE=1
-      - PYTHONUNBUFFERED=1
-      - TZ=Europe/Podgorica
-      - MAIL_DEBUG=0
-      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://arrivals:supersecretchangeit@db:5432/arrivals}
-      - UPLOAD_DIR=/app/uploads
 
   db:
     image: postgres:16-alpine
@@ -59,12 +36,11 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - ./data/pg:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U arrivals -d arrivals"]
       interval: 5s
       timeout: 3s
       retries: 20
 
-volumes:
-  pgdata:
+volumes: {}

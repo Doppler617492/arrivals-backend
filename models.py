@@ -7,10 +7,21 @@ class User(db.Model):
     __tablename__ = "users"
     id          = db.Column(db.Integer, primary_key=True)
     email       = db.Column(db.String(255), unique=True, nullable=False, index=True)
-    password    = db.Column(db.String(255), nullable=False)
+    # Keep legacy plain password column for backward compatibility (will be nulled during migration)
+    password    = db.Column(db.String(255), nullable=True)
+    # New: hashed password storage (pbkdf2:sha256)
+    password_hash = db.Column(db.String(255), nullable=True)
     name        = db.Column(db.String(255), default="")
     role        = db.Column(db.String(32),  default="viewer")
     is_active   = db.Column(db.Boolean, default=True)
+
+    # Enterprise additions (backward compatible, nullable defaults)
+    username    = db.Column(db.String(255), unique=False, index=True)
+    phone       = db.Column(db.String(64))
+    status      = db.Column(db.String(32), default="active", index=True)  # active|invited|suspended|locked
+    type        = db.Column(db.String(32), default="internal")            # internal|external
+    last_activity_at = db.Column(db.DateTime, index=True)
+    must_change_password = db.Column(db.Boolean, default=False)
 
     created_at  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     updated_at  = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -19,9 +30,14 @@ class User(db.Model):
         return {
             "id": self.id,
             "email": self.email,
+            "username": self.username or "",
             "name": self.name or "",
             "role": self.role or "viewer",
             "is_active": bool(self.is_active),
+            "phone": self.phone or "",
+            "status": (self.status or "active"),
+            "type": (self.type or "internal"),
+            "last_activity_at": (self.last_activity_at or self.updated_at or datetime.utcnow()).isoformat(),
             "created_at": (self.created_at or datetime.utcnow()).isoformat(),
             "updated_at": (self.updated_at or datetime.utcnow()).isoformat(),
         }
@@ -41,6 +57,32 @@ class ArrivalUpdate(db.Model):
     user_id     = db.Column(db.Integer, index=True)
     message     = db.Column(db.Text, nullable=False)
     created_at  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+# --- Notifications ---
+class Notification(db.Model):
+    __tablename__ = "notifications"
+    id          = db.Column(db.Integer, primary_key=True)
+    user_id     = db.Column(db.Integer, index=True, nullable=True)  # null = global
+    role        = db.Column(db.String(64), nullable=True, index=True)  # null = all roles; otherwise visible to role
+    type        = db.Column(db.String(64), default="info")         # info|warning|error|success
+    entity_type = db.Column(db.String(64), nullable=True)           # arrival|container|...
+    entity_id   = db.Column(db.Integer, nullable=True)
+    text        = db.Column(db.Text, nullable=False)
+    read        = db.Column(db.Boolean, default=False, index=True)
+    created_at  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'role': self.role,
+            'type': self.type,
+            'entity_type': self.entity_type,
+            'entity_id': self.entity_id,
+            'text': self.text,
+            'read': bool(self.read),
+            'created_at': (self.created_at or datetime.utcnow()).isoformat(),
+        }
 
 # --- Arrivals ---
 class Arrival(db.Model):
@@ -172,3 +214,70 @@ class Container(db.Model):
             "created_at": (self.created_at or datetime.utcnow()).isoformat(),
             "updated_at": (self.updated_at or datetime.utcnow()).isoformat(),
         }
+
+# --- RBAC ---
+class Role(db.Model):
+    __tablename__ = "roles"
+    id   = db.Column(db.Integer, primary_key=True)
+    key  = db.Column(db.String(64), unique=True, index=True)  # e.g. admin, manager, worker
+    name = db.Column(db.String(255))
+
+class UserRole(db.Model):
+    __tablename__ = "user_roles"
+    id       = db.Column(db.Integer, primary_key=True)
+    user_id  = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    role_id  = db.Column(db.Integer, db.ForeignKey("roles.id", ondelete="CASCADE"), index=True, nullable=False)
+    # JSON string of location codes for scope (simple, portable)
+    scope_location_ids = db.Column(db.Text)  # comma-separated list of codes e.g. "PG,NK,BAR"
+
+# --- Sessions (basic, JWT tracking) ---
+class Session(db.Model):
+    __tablename__ = "sessions"
+    id           = db.Column(db.Integer, primary_key=True)
+    user_id      = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    ip           = db.Column(db.String(64))
+    ua           = db.Column(db.Text)
+    os           = db.Column(db.String(128))
+    jti          = db.Column(db.String(128), index=True)  # JWT ID to support revocation
+    trusted      = db.Column(db.Boolean, default=False)
+    revoked      = db.Column(db.Boolean, default=False)
+    last_seen_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    created_at   = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+# --- Notification preferences ---
+class NotificationPref(db.Model):
+    __tablename__ = "notification_prefs"
+    id         = db.Column(db.Integer, primary_key=True)
+    user_id    = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    channel    = db.Column(db.String(32))     # email|slack|teams
+    event_key  = db.Column(db.String(64))     # arrivals.assigned, arrivals.due_today, container.late, ...
+    enabled    = db.Column(db.Boolean, default=True)
+    frequency  = db.Column(db.String(32), default="instant")  # instant|daily|weekly
+
+# --- Audit ---
+class AuditLog(db.Model):
+    __tablename__ = "audit_logs"
+    id            = db.Column(db.Integer, primary_key=True)
+    actor_user_id = db.Column(db.Integer, index=True)
+    event         = db.Column(db.String(128))       # e.g. users.bulk_export, users.reset_password
+    target_type   = db.Column(db.String(64))        # user|session|export
+    target_id     = db.Column(db.Integer, nullable=True)
+    meta          = db.Column(db.Text)              # JSON (string)
+    created_at    = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+# --- User notes/files ---
+class UserNote(db.Model):
+    __tablename__ = "user_notes"
+    id         = db.Column(db.Integer, primary_key=True)
+    user_id    = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    author_id  = db.Column(db.Integer, index=True)
+    text       = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+class UserFile(db.Model):
+    __tablename__ = "user_files"
+    id         = db.Column(db.Integer, primary_key=True)
+    user_id    = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    file_path  = db.Column(db.String(512), nullable=False)
+    label      = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)

@@ -10,7 +10,8 @@ import os, time
 
 from extensions import db
 from models import Container, ContainerFile
-from app import _parse_iso, _parse_float, _parse_date_any, check_api_or_jwt, has_valid_api_key, ROLE_FIELDS, can_edit
+from app import _parse_iso, _parse_float, _parse_date_any, check_api_or_jwt, has_valid_api_key, ROLE_FIELDS, can_edit, ws_broadcast, notify
+from sqlalchemy import func, and_, or_, text
 
 bp = Blueprint("containers", __name__, url_prefix="/api/containers")
 
@@ -20,7 +21,8 @@ def list_containers():
     if request.method == "OPTIONS":
         return ("", 204)
     try:
-        containers = Container.query.order_by(Container.created_at.desc()).all()
+        # Default ordering: highest ID first down to 1
+        containers = Container.query.order_by(Container.id.desc()).all()
         counts_map = dict(
             db.session.query(ContainerFile.container_id, func.count(ContainerFile.id))
             .group_by(ContainerFile.container_id).all()
@@ -108,6 +110,26 @@ def create_container():
         )
         db.session.add(c)
         db.session.commit()
+        # Persist UI notification for creation
+        try:
+            supplier = (c.supplier or '').strip()
+            title = (c.container_no or '').strip() or supplier
+            txt = f"Novi kontejner (#{c.id}{' – ' + title if title else ''})"
+            notify(txt, ntype='info', entity_type='container', entity_id=c.id)
+        except Exception:
+            pass
+        try:
+            ws_broadcast({
+                'type': 'containers.created',
+                'resource': 'containers',
+                'action': 'created',
+                'id': int(c.id),
+                'v': 1,
+                'ts': datetime.utcnow().isoformat() + 'Z',
+                'data': c.to_dict(),
+            })
+        except Exception:
+            pass
         return jsonify(c.to_dict()), 201
     except Exception as e:
         db.session.rollback()
@@ -170,6 +192,18 @@ def update_container(id):
         c.arrived_at = _parse_iso(data.get("arrived_at"))
     try:
         db.session.commit()
+        try:
+            ws_broadcast({
+                'type': 'containers.updated',
+                'resource': 'containers',
+                'action': 'updated',
+                'id': int(c.id),
+                'v': 1,
+                'ts': datetime.utcnow().isoformat() + 'Z',
+                'changes': {k: data.get(k) for k in (data.keys() if isinstance(data, dict) else [])},
+            })
+        except Exception:
+            pass
         return jsonify(c.to_dict())
     except Exception as e:
         db.session.rollback()
@@ -194,6 +228,22 @@ def delete_container(id):
     except Exception: pass
     db.session.delete(c)
     db.session.commit()
+    # Notify deletion
+    try:
+        notify(f"Kontejner obrisan (#{id})", ntype='warning', entity_type='container', entity_id=id)
+    except Exception:
+        pass
+    try:
+        ws_broadcast({
+            'type': 'containers.deleted',
+            'resource': 'containers',
+            'action': 'deleted',
+            'id': int(id),
+            'v': 1,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+        })
+    except Exception:
+        pass
     return jsonify({"ok":True,"deleted_id":id}),200
 
 # Toggle paid via status mapping (no dedicated 'paid' column)
@@ -224,7 +274,113 @@ def set_paid(id):
     try:
         db.session.commit()
         d = c.to_dict()
-        return jsonify(d)
+        try:
+            ws_broadcast({
+                'type': 'containers.updated',
+                'resource': 'containers',
+                'action': 'updated',
+                'id': int(c.id),
+                'v': 1,
+                'ts': datetime.utcnow().isoformat() + 'Z',
+                'changes': {'paid': bool(is_paid), 'status': d.get('status'), 'balance': d.get('balance')},
+            })
+        except Exception:
+            pass
+    return jsonify(d)
+
+@bp.post("/admin/wipe")
+def admin_wipe_containers():
+    """Dangerous: delete all containers and files and reset identity. Admin only. Requires confirm=yes."""
+    ok, role, uid, err = check_api_or_jwt({'wipe'})
+    if not ok:
+        return err
+    if role != 'admin':
+        return jsonify({'error':'Forbidden'}), 403
+    confirm = (request.args.get('confirm') or request.json.get('confirm') if request.is_json else request.form.get('confirm')) if request.method in ('POST','DELETE') else request.args.get('confirm')
+    confirm = str(confirm or '').lower() in ('yes','y','true','1')
+    if not confirm:
+        return jsonify({'error':'confirm_required','hint':'POST /api/containers/admin/wipe?confirm=yes'}), 400
+    try:
+        from sqlalchemy import text
+        # Prefer TRUNCATE in Postgres to reset identity
+        db.session.execute(text('TRUNCATE TABLE container_files, containers RESTART IDENTITY CASCADE'))
+        db.session.commit()
+        return jsonify({'ok': True, 'message': 'All containers deleted and IDs reset'}), 200
+    except Exception as e:
+        db.session.rollback()
+        # Fallback: delete all and attempt to reset sequence generically
+        try:
+            ContainerFile.query.delete()
+            Container.query.delete()
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            return jsonify({'error':'wipe_failed','detail':str(e)}), 500
+        return jsonify({'ok': True, 'message': 'All containers deleted (fallback).'}), 200
+
+@bp.get("/admin/export")
+def admin_export_containers():
+    ok, role, uid, err = check_api_or_jwt({'export'})
+    if not ok:
+        return err
+    if role != 'admin':
+        return jsonify({'error':'Forbidden'}), 403
+    rows = Container.query.order_by(Container.id.asc()).all()
+    out = [c.to_dict() for c in rows]
+    return jsonify({'count': len(out), 'items': out})
+
+@bp.get("/admin/duplicates")
+def admin_duplicates():
+    """List potential duplicates for a given year using selected date field and key columns.
+    Params: year=YYYY (required), date_field=etd|eta|delivery|created_at (default etd), keys=container_no,supplier (comma)
+    Returns groups with count>1 and aggregate totals.
+    """
+    ok, role, uid, err = check_api_or_jwt({'duplicates'})
+    if not ok:
+        return err
+    if role != 'admin':
+        return jsonify({'error':'Forbidden'}), 403
+    try:
+        year = int(request.args.get('year') or 0)
+    except Exception:
+        year = 0
+    if not year:
+        return jsonify({'error':'year_required'}), 400
+    field = (request.args.get('date_field') or 'etd').strip().lower()
+    keys_raw = (request.args.get('keys') or 'container_no,supplier').strip()
+    key_names = [k.strip() for k in keys_raw.split(',') if k.strip()]
+    # Python aggregation to avoid DB date/cast issues
+    y_from = f"{year}-01-01"; y_to = f"{year}-12-31"
+    rows = db.session.query(Container).all()
+    def _in_year(c):
+        try:
+            if field=='etd' and getattr(c,'etd',None): return str(c.etd)[:4]==str(year)
+            if field=='eta' and getattr(c,'eta',None): return str(c.eta)[:4]==str(year)
+            if field=='delivery' and getattr(c,'delivery',None): return str(c.delivery)[:4]==str(year)
+            return str(getattr(c,'created_at',''))[:4]==str(year)
+        except Exception:
+            return False
+    def _m2n(v):
+        try:
+            s=''.join(ch for ch in str(v) if ch.isdigit() or ch in ',.-')
+            if ',' in s and '.' not in s: s=s.replace(',', '.')
+            return float(s or 0)
+        except Exception:
+            return 0.0
+    groups = {}
+    for c in rows:
+        if not _in_year(c): continue
+        key = tuple((getattr(c,k) if hasattr(c,k) else None) for k in key_names)
+        g = groups.setdefault(key, {'count':0,'total_sum':0.0})
+        g['count'] += 1
+        g['total_sum'] += _m2n(getattr(c,'total',0))
+    out=[]
+    for key,g in groups.items():
+        if g['count']>1:
+            rec={'count':g['count'],'total_sum':g['total_sum']}
+            for i,k in enumerate(key_names): rec[k]=key[i]
+            out.append(rec)
+    return jsonify({'year':year,'date_field':field,'keys':key_names,'groups':out,'groups_count':len(out)})
     except Exception as e:
         db.session.rollback()
         return jsonify({"error":"update_failed","detail":str(e)}),500
@@ -240,6 +396,18 @@ def set_status(id):
     c.status = status
     try:
         db.session.commit()
+        try:
+            ws_broadcast({
+                'type': 'containers.updated',
+                'resource': 'containers',
+                'action': 'updated',
+                'id': int(c.id),
+                'v': 1,
+                'ts': datetime.utcnow().isoformat() + 'Z',
+                'changes': {'status': status},
+            })
+        except Exception:
+            pass
         return jsonify(c.to_dict())
     except Exception as e:
         db.session.rollback()
@@ -276,6 +444,10 @@ def upload_file(cid):
             "url": f"/files/{rec.filename}",
         })
     db.session.commit()
+    try:
+        notify(f"Dodati fajlovi (#{cid})", ntype='info', entity_type='container', entity_id=cid)
+    except Exception:
+        pass
     return jsonify(recs),201
 
 @bp.get("/<int:cid>/files")
@@ -314,4 +486,8 @@ def delete_file(cid, file_id):
     except Exception: pass
     db.session.delete(rec)
     db.session.commit()
+    try:
+        notify(f"Obrisan fajl (#{cid})", ntype='warning', entity_type='container', entity_id=cid)
+    except Exception:
+        pass
     return jsonify({"ok":True,"deleted_id":file_id})

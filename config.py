@@ -9,10 +9,14 @@ def allowed_origins():
     return [o.strip() for o in raw.split(",") if o.strip()]
 
 def load_config(app):
-    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
-        'DATABASE_URL',
-        os.environ.get('SQLITE_URL', 'sqlite:///arrivals.db')
-    )
+    # Enforce Postgres: require DATABASE_URL and do not fall back to SQLite
+    db_url = os.environ.get('DATABASE_URL')
+    if not db_url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Configure a Postgres DSN, e.g. "
+            "postgresql+psycopg://user:pass@host:5432/dbname"
+        )
+    app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'change-me-dev')
     app.config['JWT_TOKEN_LOCATION'] = ['headers']

@@ -24,8 +24,10 @@ COPY . /app
 # (Optional) set Flask env vars if your app reads them
 ENV FLASK_APP=app.py
 
-EXPOSE 5000
+EXPOSE 8081
 
 # Start with Gunicorn in production
 # If your Flask instance is named "app" inside app.py, this works:
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "app:app"]
+# Use a WebSocket-capable worker so Flask-Sock /ws works
+# Requires gevent + gevent-websocket (added to requirements.txt)
+CMD ["gunicorn", "-k", "geventwebsocket.gunicorn.workers.GeventWebSocketWorker", "-w", "2", "--timeout", "90", "-b", "0.0.0.0:8081", "app:app"]

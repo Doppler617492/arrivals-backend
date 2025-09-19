@@ -4,7 +4,7 @@ from flask_jwt_extended import jwt_required  # ako želiš zaštitu, za sad je p
 from models import Arrival
 from extensions import db
 
-bp = Blueprint("locations", __name__, url_prefix="/api/locations", strict_slashes=False)
+bp = Blueprint("locations", __name__, url_prefix="/api/locations")
 
 @bp.route("", methods=["GET", "HEAD", "OPTIONS"])
 def list_locations():

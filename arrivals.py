@@ -9,11 +9,11 @@ from datetime import datetime
 import os, time
 
 from extensions import db
-from app import Arrival, ArrivalFile, ArrivalUpdate
+from app import Arrival, ArrivalFile, ArrivalUpdate, ws_broadcast, notify
 from services.mailer import send_email, all_user_emails  # if available
 from app import _parse_iso, _parse_float, check_api_or_jwt, has_valid_api_key, ROLE_FIELDS, can_edit, ALLOWED_STATUSES, NOTIFY_ON_STATUS
 
-bp = Blueprint("arrivals", __name__, url_prefix="/api/arrivals", strict_slashes=False)
+bp = Blueprint("arrivals", __name__, url_prefix="/api/arrivals")
 
 @bp.route("", methods=["GET", "HEAD", "OPTIONS"])
 @bp.route("/", methods=["GET", "HEAD", "OPTIONS"])
@@ -84,6 +84,7 @@ def search_arrivals():
     return jsonify({'page': page, 'per_page': per_page, 'total': total, 'items': items_payload})
 
 @bp.post("/")
+@bp.post("")
 def create_arrival():
     data = request.json or {}
     loc = data.get('location')
@@ -106,6 +107,18 @@ def create_arrival():
         location=loc, assignee_id=data.get('assignee_id')
     )
     db.session.add(a); db.session.commit()
+    try:
+        ws_broadcast({
+            'type': 'arrivals.created',
+            'resource': 'arrivals',
+            'action': 'created',
+            'id': int(a.id),
+            'v': 1,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+            'data': a.to_dict(),
+        })
+    except Exception:
+        pass
     return jsonify(a.to_dict()), 201
 
 @bp.patch("/<int:id>")
@@ -140,6 +153,29 @@ def update_arrival(id):
     if 'pickup_date' in data and can_set('pickup_date'): a.pickup_date=_parse_iso(data.get('pickup_date'))
     if 'goods_cost' in data and can_set('goods_cost'): a.goods_cost=_parse_float(data.get('goods_cost'))
     db.session.commit()
+    # Notify meaningful changes (eta/location/note)
+    try:
+        from app import notify
+        if 'eta' in data:
+            notify(f"Promjena ETA (#{a.id})", ntype='info', entity_type='arrival', entity_id=a.id)
+        if 'location' in data:
+            notify(f"Promjena lokacije (#{a.id})", ntype='info', entity_type='arrival', entity_id=a.id)
+        if 'note' in data:
+            notify(f"Ažurirana napomena (#{a.id})", ntype='info', entity_type='arrival', entity_id=a.id)
+    except Exception:
+        pass
+    try:
+        ws_broadcast({
+            'type': 'arrivals.updated',
+            'resource': 'arrivals',
+            'action': 'updated',
+            'id': int(a.id),
+            'v': 1,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+            'changes': {k: data.get(k) for k in (data.keys() if isinstance(data, dict) else [])},
+        })
+    except Exception:
+        pass
     return jsonify(a.to_dict())
 
 @bp.patch("/<int:id>/status")
@@ -166,7 +202,29 @@ def update_arrival_status(id):
                     to_list=all_user_emails()
                 )
             except Exception as e: print("[STATUS MAIL ERROR]",e)
-    db.session.commit(); return jsonify(a.to_dict())
+            # Also persist a UI notification for key transitions
+            try:
+                status_l = str(data['status']).lower()
+                if status_l in ('shipped', 'u transportu', 'transport'):
+                    notify(f"Promjena statusa na U transportu (#{a.id})", ntype='info', entity_type='arrival', entity_id=a.id)
+                elif status_l in ('arrived', 'stiglo'):
+                    notify(f"Stiglo (#{a.id})", ntype='success', entity_type='arrival', entity_id=a.id)
+            except Exception:
+                pass
+    db.session.commit()
+    try:
+        ws_broadcast({
+            'type': 'arrivals.updated',
+            'resource': 'arrivals',
+            'action': 'updated',
+            'id': int(a.id),
+            'v': 1,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+            'changes': {k: data.get(k) for k in (data.keys() if isinstance(data, dict) else [])},
+        })
+    except Exception:
+        pass
+    return jsonify(a.to_dict())
 
 @bp.delete("/<int:id>")
 @jwt_required(optional=True)
@@ -184,6 +242,22 @@ def delete_arrival(id):
             except Exception: pass
     except Exception: pass
     db.session.delete(a); db.session.commit()
+    try:
+        from app import notify
+        notify(f"Dolazak obrisan (#{id})", ntype='warning', entity_type='arrival', entity_id=id)
+    except Exception:
+        pass
+    try:
+        ws_broadcast({
+            'type': 'arrivals.deleted',
+            'resource': 'arrivals',
+            'action': 'deleted',
+            'id': int(id),
+            'v': 1,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+        })
+    except Exception:
+        pass
     return jsonify({'ok':True,'deleted_id':id}),200
 
 @bp.delete("/bulk_delete")
@@ -206,6 +280,18 @@ def bulk_delete_arrivals():
     except Exception: pass
     db.session.query(Arrival).filter(Arrival.id.in_(ids)).delete(synchronize_session=False)
     db.session.commit()
+    try:
+        ws_broadcast({
+            'type': 'system.bulk',
+            'v': 1,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+            'events': [
+                {'type':'arrivals.deleted','resource':'arrivals','action':'deleted','id': int(x), 'v':1, 'ts': datetime.utcnow().isoformat() + 'Z'}
+                for x in ids
+            ],
+        })
+    except Exception:
+        pass
     return jsonify({'ok':True,'deleted':ids}),200
 
 @bp.delete("/")
@@ -234,6 +320,18 @@ def delete_arrivals_querystring():
     except Exception: pass
     db.session.query(Arrival).filter(Arrival.id.in_(ids)).delete(synchronize_session=False)
     db.session.commit()
+    try:
+        ws_broadcast({
+            'type': 'system.bulk',
+            'v': 1,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+            'events': [
+                {'type':'arrivals.deleted','resource':'arrivals','action':'deleted','id': int(x), 'v':1, 'ts': datetime.utcnow().isoformat() + 'Z'}
+                for x in ids
+            ],
+        })
+    except Exception:
+        pass
     return jsonify({'ok':True,'deleted':ids}),200
 
 @bp.get("/<int:arrival_id>/updates")
@@ -267,7 +365,13 @@ def upload_file(arrival_id):
         rec=ArrivalFile(arrival_id=arrival_id,filename=unique_name,original_name=safe_name)
         db.session.add(rec); db.session.flush()
         recs.append({'id':rec.id,'arrival_id':rec.arrival_id,'filename':rec.filename,'original_name':rec.original_name,'uploaded_at':(rec.uploaded_at or datetime.utcnow()).isoformat(),'url':f"/files/{rec.filename}"})
-    db.session.commit(); return jsonify(recs),201
+    db.session.commit();
+    try:
+        from app import notify
+        notify(f"Dodati fajlovi (#{arrival_id})", ntype='info', entity_type='arrival', entity_id=arrival_id)
+    except Exception:
+        pass
+    return jsonify(recs),201
 
 @bp.get("/<int:arrival_id>/files")
 @jwt_required(optional=True)
@@ -289,4 +393,9 @@ def delete_file(arrival_id,file_id):
     try: os.remove(os.path.join(current_app.config['UPLOAD_FOLDER'],rec.filename))
     except Exception: pass
     db.session.delete(rec); db.session.commit()
+    try:
+        from app import notify
+        notify(f"Obrisan fajl (#{arrival_id})", ntype='warning', entity_type='arrival', entity_id=arrival_id)
+    except Exception:
+        pass
     return jsonify({'ok':True,'deleted_id':file_id})

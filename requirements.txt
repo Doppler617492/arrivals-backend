@@ -4,6 +4,10 @@ Flask==3.1.1
 flask-cors==6.0.1
 Flask-JWT-Extended==4.7.1
 Flask-SQLAlchemy==3.1.1
+flask-sock==0.7.0
+simple-websocket==1.0.0
+gevent==24.2.1
+gevent-websocket==0.10.1
 itsdangerous==2.2.0
 Jinja2==3.1.6
 MarkupSafe==3.0.2

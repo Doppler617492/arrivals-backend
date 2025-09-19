@@ -2,7 +2,11 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, scoped_session, declarative_base
 
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SQLITE_URL", "sqlite:///arrivals.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Configure Postgres DSN, e.g. postgresql+psycopg://user:pass@host:5432/dbname"
+    )
 
 engine = create_engine(
     DATABASE_URL,

@@ -10,8 +10,9 @@ from flask_jwt_extended import (
     get_jwt_identity,
     verify_jwt_in_request,
 )
+from flask_jwt_extended.utils import get_jti
 import os
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 # Try to use shared singletons
 try:
@@ -34,7 +35,7 @@ except Exception:
         # As a last resort, we will use a raw query path when needed.
         pass
 
-bp = Blueprint("auth", __name__, url_prefix="/auth", strict_slashes=False)
+bp = Blueprint("auth", __name__, url_prefix="/auth")
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -112,10 +113,47 @@ def login():
     if not user:
         return jsonify({"ok": False, "error": "Invalid credentials"}), 401
 
-    if not getattr(user, "password_hash", None) or not check_password_hash(user.password_hash, password):
+    # Support both hashed (password_hash) and legacy plain (password) fields
+    if hasattr(user, "password_hash") and getattr(user, "password_hash", None):
+        if not check_password_hash(user.password_hash, password):
+            return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+    elif hasattr(user, "password"):
+        if str(getattr(user, "password") or "") != str(password):
+            return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+    else:
         return jsonify({"ok": False, "error": "Invalid credentials"}), 401
 
     token = _issue_token_for(user)
+    # Record session (basic)
+    try:
+        from models import Session as UserSession  # lazy import to avoid cycles
+        jti = get_jti(token)
+        ua = request.headers.get('User-Agent')
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        os_name = None
+        try:
+            # naive detection from UA
+            s = (ua or '').lower()
+            if 'windows' in s: os_name = 'Windows'
+            elif 'mac os' in s or 'macintosh' in s: os_name = 'macOS'
+            elif 'linux' in s: os_name = 'Linux'
+            elif 'android' in s: os_name = 'Android'
+            elif 'iphone' in s or 'ios' in s: os_name = 'iOS'
+        except Exception:
+            os_name = None
+        sess = UserSession(user_id=getattr(user, 'id', None), ip=ip, ua=ua, os=os_name, jti=jti)
+        db.session.add(sess)
+        # Update last activity on login
+        try:
+            user.last_activity_at = datetime.utcnow()
+        except Exception:
+            pass
+        db.session.commit()
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
     user_payload = {
         "id": getattr(user, "id", None),
         "email": getattr(user, "email", None),

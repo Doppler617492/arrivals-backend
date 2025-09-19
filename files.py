@@ -4,7 +4,7 @@
 from flask import Blueprint, request, send_from_directory, jsonify, current_app
 from flask_jwt_extended import jwt_required
 
-bp = Blueprint("files", __name__, url_prefix="/files", strict_slashes=False)
+bp = Blueprint("files", __name__, url_prefix="/files")
 
 @bp.route("/<path:filename>", methods=["GET", "HEAD", "OPTIONS"])
 def get_file(filename: str):
