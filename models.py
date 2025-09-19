@@ -21,7 +21,12 @@ class User(db.Model):
     status      = db.Column(db.String(32), default="active", index=True)  # active|invited|suspended|locked
     type        = db.Column(db.String(32), default="internal")            # internal|external
     last_activity_at = db.Column(db.DateTime, index=True)
+    last_login_at = db.Column(db.DateTime, index=True)
+    failed_logins = db.Column(db.Integer, default=0)
     must_change_password = db.Column(db.Boolean, default=False)
+    require_password_change = db.Column(db.Boolean, default=False)
+    note        = db.Column(db.Text)
+    deleted_at  = db.Column(db.DateTime, index=True)
 
     created_at  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     updated_at  = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -38,6 +43,9 @@ class User(db.Model):
             "status": (self.status or "active"),
             "type": (self.type or "internal"),
             "last_activity_at": (self.last_activity_at or self.updated_at or datetime.utcnow()).isoformat(),
+            "last_login_at": (self.last_login_at or None).isoformat() if self.last_login_at else None,
+            "failed_logins": int(self.failed_logins or 0),
+            "require_password_change": bool(self.require_password_change or self.must_change_password or False),
             "created_at": (self.created_at or datetime.utcnow()).isoformat(),
             "updated_at": (self.updated_at or datetime.utcnow()).isoformat(),
         }
@@ -229,6 +237,12 @@ class UserRole(db.Model):
     role_id  = db.Column(db.Integer, db.ForeignKey("roles.id", ondelete="CASCADE"), index=True, nullable=False)
     # JSON string of location codes for scope (simple, portable)
     scope_location_ids = db.Column(db.Text)  # comma-separated list of codes e.g. "PG,NK,BAR"
+
+class UserLocation(db.Model):
+    __tablename__ = "user_locations"
+    id       = db.Column(db.Integer, primary_key=True)
+    user_id  = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    location = db.Column(db.String(255), index=True)
 
 # --- Sessions (basic, JWT tracking) ---
 class Session(db.Model):

@@ -12,7 +12,7 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from extensions import db
 from models import (
     User, Role, UserRole, Session as UserSession,
-    NotificationPref, AuditLog, ArrivalUpdate, Arrival, UserNote, UserFile
+    NotificationPref, AuditLog, ArrivalUpdate, Arrival, UserNote, UserFile, UserLocation
 )
 from sqlalchemy import func
 import os
@@ -168,42 +168,104 @@ def _compute_last_activity(user: User) -> datetime:
 @bp.get("")
 @jwt_required()
 def list_users():
-    role = (request.args.get("role") or "").strip().lower()
-    status = (request.args.get("status") or "").strip().lower()
+    # Filters
+    qtext = (request.args.get("q") or "").strip().lower()
+    role = (request.args.get("role") or request.args.get("roles") or "").strip().lower()
+    status = (request.args.get("status") or request.args.get("statuses") or "").strip().lower()
+    locations = (request.args.get("location") or request.args.get("locations") or "").strip()
     since_s = request.args.get("since") or ""
     since = _parse_since(since_s) or (_now_utc() - timedelta(days=7))
+    created_from = request.args.get("created_from"); created_to = request.args.get("created_to")
+    last_login_from = request.args.get("last_login_from"); last_login_to = request.args.get("last_login_to")
+    failed_logins_gte = request.args.get("failed_logins_gte")
+    # Pagination/sort
+    page = int(request.args.get("page") or 0)
+    page_size = int(request.args.get("page_size") or 0)
+    sort = (request.args.get("sort") or "").strip()
 
     q = db.session.query(User)
+    if qtext:
+        q = q.filter((User.name.ilike(f"%{qtext}%")) | (User.email.ilike(f"%{qtext}%")) | (User.username.ilike(f"%{qtext}%")))
     if role:
-        q = q.filter(User.role == role)
+        roles = [r.strip() for r in role.split(',') if r.strip()]
+        q = q.filter(User.role.in_(roles))
     if status:
-        q = q.filter(User.status == status)
+        statuses = [s.strip() for s in status.split(',') if s.strip()]
+        q = q.filter(User.status.in_(statuses))
+    if locations:
+        locs = [l.strip() for l in locations.split(',') if l.strip()]
+        if locs:
+            q = q.join(UserLocation, UserLocation.user_id == User.id, isouter=True).filter(UserLocation.location.in_(locs))
+    if created_from:
+        try:
+            q = q.filter(User.created_at >= datetime.fromisoformat(created_from))
+        except Exception:
+            pass
+    if created_to:
+        try:
+            q = q.filter(User.created_at <= datetime.fromisoformat(created_to))
+        except Exception:
+            pass
+    if last_login_from:
+        try:
+            q = q.filter(User.last_login_at >= datetime.fromisoformat(last_login_from))
+        except Exception:
+            pass
+    if last_login_to:
+        try:
+            q = q.filter(User.last_login_at <= datetime.fromisoformat(last_login_to))
+        except Exception:
+            pass
+    if failed_logins_gte and str(failed_logins_gte).isdigit():
+        q = q.filter((User.failed_logins.isnot(None)) & (User.failed_logins >= int(failed_logins_gte)))
 
-    rows = q.order_by(User.created_at.desc()).all()
+    # Sort
+    if sort:
+        desc = sort.startswith('-'); key = sort[1:] if desc else sort
+        col = getattr(User, key, None)
+        if col is not None:
+            q = q.order_by(col.desc() if desc else col.asc())
+    else:
+        q = q.order_by(User.created_at.desc())
+
+    # Pagination envelope if present
+    total = None
+    if page and page_size:
+        page = max(1, page)
+        page_size = max(1, min(200, page_size))
+        total = q.count()
+        q = q.offset((page-1)*page_size).limit(page_size)
+
+    rows = q.all()
     out = []
     for u in rows:
-    days = 7 if since_s in ("", "7d") else (1 if since_s == "24h" else 30)
-    prod = _productivity_for_user(u.id, since, days)
-    # tasks_today: arrivals assigned to user with due today and not arrived
-    tasks_today = 0
-    try:
-        today = _now_utc().date()
-        tasks_today = db.session.query(Arrival).filter(
-            Arrival.assignee_id == u.id,
-            Arrival.arrived_at.is_(None),
-            (
-                (Arrival.production_due.isnot(None) & (func.date(Arrival.production_due) == today)) |
-                (Arrival.eta.isnot(None))
-            )
-        ).count()
-    except Exception:
+        days = 7 if since_s in ("", "7d") else (1 if since_s == "24h" else 30)
+        prod = _productivity_for_user(u.id, since, days)
+        # tasks_today
         tasks_today = 0
+        try:
+            today = _now_utc().date()
+            tasks_today = db.session.query(Arrival).filter(
+                Arrival.assignee_id == u.id,
+                Arrival.arrived_at.is_(None),
+                ((Arrival.production_due.isnot(None) & (func.date(Arrival.production_due) == today)) | (Arrival.eta.isnot(None)))
+            ).count()
+        except Exception:
+            tasks_today = 0
+        # locations
+        try:
+            user_locs = [ul.location for ul in db.session.query(UserLocation).filter_by(user_id=u.id).all()]
+        except Exception:
+            user_locs = []
         out.append({
             **u.to_dict(),
+            "locations": user_locs,
             "tasks_today": int(tasks_today),
             "kpi_7d": prod,
             "last_activity_at": (_compute_last_activity(u) or _now_utc()).isoformat(),
         })
+    if total is not None:
+        return jsonify({"items": out, "total": int(total), "page": page, "page_size": page_size}), 200
     return jsonify(out), 200
 
 
@@ -236,9 +298,14 @@ def update_profile(uid: int):
     if not u:
         return jsonify({"error": "not_found"}), 404
     data = request.get_json(silent=True) or {}
-    for k in ["name", "phone", "type", "status", "username", "role", "is_active"]:
+    for k in ["name", "phone", "type", "status", "username", "role", "is_active", "note", "require_password_change"]:
         if k in data:
             setattr(u, k, data.get(k))
+    if isinstance(data.get('locations'), list):
+        db.session.query(UserLocation).filter_by(user_id=uid).delete()
+        for loc in data.get('locations'):
+            if str(loc).strip():
+                db.session.add(UserLocation(user_id=uid, location=str(loc).strip()))
     db.session.commit()
     _audit("users.update", target_type="user", target_id=uid, meta={"fields": list(data.keys())})
     return jsonify(u.to_dict()), 200
@@ -334,6 +401,7 @@ def reset_password(uid: int):
         # store in legacy plain for compatibility and set flag to change on first login
         u.password = temp
         u.must_change_password = True
+        u.require_password_change = True
     db.session.commit()
     _audit("users.password.reset", target_type="user", target_id=uid, meta={"generate_temp": generate_temp})
     return jsonify({"ok": True, "temp_password": temp})
@@ -526,6 +594,201 @@ def download_file(uid: int, fid: int):
         return jsonify({"error": "not_found"}), 404
     upload_dir = current_app.config.get('UPLOAD_FOLDER')
     return send_from_directory(upload_dir, rec.file_path, as_attachment=True)
+
+
+# --- CRUD and admin actions --------------------------------------------------
+
+@bp.post("")
+@jwt_required()
+def create_user():
+    data = request.get_json(silent=True) or {}
+    email = (data.get('email') or '').strip().lower()
+    name = (data.get('name') or '').strip()
+    role = (data.get('role') or 'viewer').strip().lower()
+    if not email or not name:
+        return jsonify({'error': 'name_email_required'}), 400
+    if db.session.query(User).filter_by(email=email).first():
+        return jsonify({'error': 'email_exists'}), 409
+    u = User(email=email, name=name, role=role, status=data.get('status') or 'active', phone=data.get('phone') or None)
+    temp_password = None
+    if data.get('password'):
+        u.password = str(data.get('password'))
+    elif data.get('require_password_change') or data.get('temporary_password'):
+        import secrets, string
+        temp_password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+        u.password = temp_password
+        u.must_change_password = True
+        u.require_password_change = True
+    db.session.add(u)
+    db.session.flush()
+    for loc in (data.get('locations') or []):
+        if str(loc).strip():
+            db.session.add(UserLocation(user_id=u.id, location=str(loc).strip()))
+    db.session.commit()
+    _audit('USER_CREATED', target_type='user', target_id=int(u.id), meta={'email': email, 'role': role})
+    out = u.to_dict()
+    if temp_password:
+        out['temporary_password'] = temp_password
+    return jsonify(out), 201
+
+
+@bp.delete("/<int:uid>")
+@jwt_required()
+def soft_delete(uid: int):
+    u = db.session.get(User, uid)
+    if not u:
+        return jsonify({'error': 'not_found'}), 404
+    u.status = 'deleted'
+    u.deleted_at = _now_utc()
+    db.session.commit()
+    _audit('USER_DELETED_SOFT', target_type='user', target_id=uid, meta={})
+    return jsonify({'ok': True})
+
+
+@bp.post("/<int:uid>/lock")
+@jwt_required()
+def lock_user(uid: int):
+    u = db.session.get(User, uid)
+    if not u:
+        return jsonify({'error': 'not_found'}), 404
+    u.status = 'locked'
+    db.session.commit()
+    _audit('STATUS_CHANGED', target_type='user', target_id=uid, meta={'status': 'locked'})
+    return jsonify({'ok': True})
+
+
+@bp.post("/<int:uid>/unlock")
+@jwt_required()
+def unlock_user(uid: int):
+    u = db.session.get(User, uid)
+    if not u:
+        return jsonify({'error': 'not_found'}), 404
+    if u.status == 'locked':
+        u.status = 'active'
+        u.failed_logins = 0
+    db.session.commit()
+    _audit('STATUS_CHANGED', target_type='user', target_id=uid, meta={'status': 'active'})
+    return jsonify({'ok': True})
+
+
+@bp.post("/<int:uid>/password/change")
+@jwt_required()
+def change_password(uid: int):
+    data = request.get_json(silent=True) or {}
+    old = data.get('old_password') or ''
+    new = data.get('new_password') or ''
+    if len(new) < 10:
+        return jsonify({'error': 'password_policy', 'detail': 'min_length'}), 400
+    u = db.session.get(User, uid)
+    if not u:
+        return jsonify({'error': 'not_found'}), 404
+    if u.password and str(u.password) != str(old):
+        return jsonify({'error': 'invalid_old_password'}), 400
+    u.password = new
+    u.must_change_password = False
+    u.require_password_change = False
+    db.session.commit()
+    _audit('PASSWORD_CHANGED', target_type='user', target_id=uid, meta={})
+    return jsonify({'ok': True})
+
+
+# Unified bulk and import -----------------------------------------------------
+
+@bp.post("/bulk")
+@jwt_required()
+def bulk():
+    data = request.get_json(silent=True) or {}
+    action = str(data.get('action') or '').strip()
+    ids = [int(i) for i in (data.get('ids') or [])]
+    payload = data.get('payload') or {}
+    updated = 0
+    if action in ('activate','deactivate'):
+        status = 'active' if action=='activate' else 'inactive'
+        for uid in ids:
+            u = db.session.get(User, uid)
+            if not u: continue
+            u.status = status
+            updated += 1
+        db.session.commit()
+        _audit('users.bulk.status', target_type='user', target_id=None, meta={'count': updated, 'status': status})
+        return jsonify({'ok': True, 'updated': updated})
+    if action == 'assign_role':
+        roles = payload.get('roles') or []
+        scope = payload.get('locations') or []
+        existing = {r.key: r for r in db.session.query(Role).filter(Role.key.in_(roles or [''])).all()}
+        for key in roles:
+            if key not in existing:
+                r = Role(key=key, name=key.title()); db.session.add(r); db.session.flush(); existing[key] = r
+        for uid in ids:
+            db.session.query(UserRole).filter_by(user_id=uid).delete()
+            for key in roles:
+                db.session.add(UserRole(user_id=uid, role_id=existing[key].id, scope_location_ids=",".join(scope)))
+            db.session.query(UserLocation).filter_by(user_id=uid).delete()
+            for loc in scope:
+                if str(loc).strip(): db.session.add(UserLocation(user_id=uid, location=str(loc).strip()))
+            u = db.session.get(User, uid)
+            if u and roles: u.role = roles[0]
+            updated += 1
+        db.session.commit()
+        _audit('users.bulk.roles', target_type='user', target_id=None, meta={'count': updated, 'roles': roles, 'locations': scope})
+        return jsonify({'ok': True, 'updated': updated})
+    if action == 'reset_password':
+        out = {}
+        import secrets, string
+        for uid in ids:
+            u = db.session.get(User, uid)
+            if not u: continue
+            temp = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+            u.password = temp; u.must_change_password = True; u.require_password_change = True
+            out[uid] = temp; updated += 1
+        db.session.commit()
+        _audit('users.bulk.reset_password', target_type='user', target_id=None, meta={'count': updated})
+        return jsonify({'ok': True, 'temp_passwords': out})
+    if action == 'delete':
+        for uid in ids:
+            u = db.session.get(User, uid)
+            if not u: continue
+            u.status = 'deleted'; u.deleted_at = _now_utc(); updated += 1
+        db.session.commit()
+        _audit('users.bulk.delete', target_type='user', target_id=None, meta={'count': updated})
+        return jsonify({'ok': True, 'deleted': updated})
+    return jsonify({'error': 'unknown_action'}), 400
+
+
+@bp.post("/import")
+@jwt_required()
+def import_users():
+    dry = str(request.args.get('dry_run') or request.form.get('dry_run') or '0').lower() in ('1','true','yes','on')
+    f = request.files.get('file')
+    if not f:
+        return jsonify({'error': 'file_required'}), 400
+    try:
+        stream = io.StringIO(f.read().decode('utf-8'))
+    except Exception:
+        stream = io.StringIO(f.read().decode('latin-1'))
+    reader = csv.DictReader(stream)
+    created = 0; updated = 0; errors = []
+    for i, row in enumerate(reader):
+        try:
+            email = (row.get('email') or '').strip().lower(); name = (row.get('name') or '').strip(); role = (row.get('role') or 'viewer').strip().lower(); status = (row.get('status') or 'active').strip().lower()
+            locs = [s.strip() for s in (row.get('locations') or '').split(',') if s.strip()]
+            if not email or not name: raise ValueError('name/email required')
+            u = db.session.query(User).filter_by(email=email).first()
+            if not u:
+                u = User(email=email, name=name, role=role, status=status); db.session.add(u); db.session.flush(); created += 1
+            else:
+                u.name = name; u.role = role; u.status = status; updated += 1
+            if not dry:
+                db.session.query(UserLocation).filter_by(user_id=u.id).delete()
+                for loc in locs:
+                    db.session.add(UserLocation(user_id=u.id, location=loc))
+        except Exception as e:
+            errors.append({'row': i+2, 'error': str(e)})
+    if dry:
+        db.session.rollback()
+    else:
+        db.session.commit(); _audit('users.import', target_type='user', target_id=None, meta={'created': created, 'updated': updated, 'errors': len(errors)})
+    return jsonify({'ok': True, 'created': created, 'updated': updated, 'errors': errors, 'dry_run': dry})
 
 
 # --- bulk actions ------------------------------------------------------------

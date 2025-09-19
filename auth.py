@@ -111,17 +111,51 @@ def login():
 
     user = _get_user_by_email(email)
     if not user:
+        # Audit failed login (if model available)
+        try:
+            from models import AuditLog
+            db.session.add(AuditLog(actor_user_id=None, target_type='user', target_id=None, event='LOGIN_FAILED', meta=f'email={email}'))
+            db.session.commit()
+        except Exception:
+            try: db.session.rollback()
+            except Exception: pass
         return jsonify({"ok": False, "error": "Invalid credentials"}), 401
 
     # Support both hashed (password_hash) and legacy plain (password) fields
     if hasattr(user, "password_hash") and getattr(user, "password_hash", None):
         if not check_password_hash(user.password_hash, password):
+            try:
+                # Increment failed logins and optionally lock account
+                if hasattr(user, 'failed_logins'):
+                    user.failed_logins = int(getattr(user, 'failed_logins') or 0) + 1
+                    # Lock after 5
+                    if user.failed_logins >= int(os.environ.get('LOCKOUT_THRESHOLD', '5')):
+                        try: setattr(user, 'status', 'locked')
+                        except Exception: pass
+                db.session.commit()
+            except Exception:
+                try: db.session.rollback()
+                except Exception: pass
             return jsonify({"ok": False, "error": "Invalid credentials"}), 401
     elif hasattr(user, "password"):
         if str(getattr(user, "password") or "") != str(password):
             return jsonify({"ok": False, "error": "Invalid credentials"}), 401
     else:
+        try:
+            if hasattr(user, 'failed_logins'):
+                user.failed_logins = int(getattr(user, 'failed_logins') or 0) + 1
+                if user.failed_logins >= int(os.environ.get('LOCKOUT_THRESHOLD', '5')):
+                    try: setattr(user, 'status', 'locked')
+                    except Exception: pass
+            db.session.commit()
+        except Exception:
+            try: db.session.rollback()
+            except Exception: pass
         return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+
+    # Prevent login if locked or inactive
+    if getattr(user, 'status', None) in ('locked', 'deleted', 'inactive'):
+        return jsonify({"ok": False, "error": "Account not active"}), 403
 
     token = _issue_token_for(user)
     # Record session (basic)
@@ -146,6 +180,8 @@ def login():
         # Update last activity on login
         try:
             user.last_activity_at = datetime.utcnow()
+            user.last_login_at = datetime.utcnow()
+            user.failed_logins = 0
         except Exception:
             pass
         db.session.commit()
