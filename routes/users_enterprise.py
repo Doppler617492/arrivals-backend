@@ -56,6 +56,93 @@ def _audit(event: str, target_type: str, target_id: Optional[int] = None, meta: 
             pass
 
 
+# --- RBAC helpers ------------------------------------------------------------
+
+ROLE_PRIVS = {
+    # sensible defaults; can be expanded/configured
+    'admin': {
+        'user.create','user.read','user.update','user.delete_soft',
+        'user.password.reset','user.status.lock','user.session.revoke',
+        'user.role.assign','user.scope.assign','user.import','user.export','user.bulk'
+    },
+    'manager': {
+        'user.read','user.update','user.password.reset','user.session.revoke','user.role.assign','user.scope.assign','user.bulk','user.export'
+    },
+    'operator': {'user.read','user.password.reset'},
+    'viewer': {'user.read'},
+}
+
+
+def _current_user() -> Optional[User]:
+    try:
+        uid = int(get_jwt_identity() or 0)
+        if not uid:
+            return None
+        return db.session.get(User, uid)
+    except Exception:
+        return None
+
+
+def _effective_privs(user: User) -> set[str]:
+    base = set(ROLE_PRIVS.get((user.role or 'viewer'), set()))
+    try:
+        # extra roles via UserRole
+        ur = db.session.query(UserRole, Role).join(Role, Role.id == UserRole.role_id).filter(UserRole.user_id == user.id).all()
+        for _, r in ur:
+            base |= set(ROLE_PRIVS.get((r.key or ''), set()))
+    except Exception:
+        pass
+    return base
+
+
+def require_perms(perms: list[str]):
+    def deco(fn):
+        @jwt_required()
+        def wrapper(*args, **kwargs):
+            u = _current_user()
+            if not u:
+                return jsonify({'error':'unauthorized'}), 401
+            if (u.role or '') == 'admin':
+                return fn(*args, **kwargs)
+            eff = _effective_privs(u)
+            if not all(p in eff for p in perms):
+                return jsonify({'error':'forbidden', 'missing': [p for p in perms if p not in eff]}), 403
+            return fn(*args, **kwargs)
+        wrapper.__name__ = fn.__name__
+        return wrapper
+    return deco
+
+
+def within_scope(target_user_id_param: str = 'uid'):
+    def deco(fn):
+        @jwt_required()
+        def wrapper(*args, **kwargs):
+            actor = _current_user()
+            if not actor:
+                return jsonify({'error':'unauthorized'}), 401
+            # Admin bypass
+            if (actor.role or '') == 'admin':
+                return fn(*args, **kwargs)
+            try:
+                target_id = int(kwargs.get(target_user_id_param))
+            except Exception:
+                return jsonify({'error':'bad_target'}), 400
+            # If actor has no scope records, allow only self
+            actor_locs = [ul.location for ul in db.session.query(UserLocation).filter_by(user_id=actor.id).all()]
+            if not actor_locs:
+                if target_id != actor.id:
+                    return jsonify({'error':'forbidden_scope'}), 403
+                return fn(*args, **kwargs)
+            # If target shares at least one location, allow
+            target_locs = [ul.location for ul in db.session.query(UserLocation).filter_by(user_id=target_id).all()]
+            if any(l in actor_locs for l in target_locs):
+                return fn(*args, **kwargs)
+            return jsonify({'error':'forbidden_scope'}), 403
+        wrapper.__name__ = fn.__name__
+        return wrapper
+    return deco
+
+
 def _parse_since(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
@@ -166,7 +253,7 @@ def _compute_last_activity(user: User) -> datetime:
 # --- routes ------------------------------------------------------------------
 
 @bp.get("")
-@jwt_required()
+@require_perms(['user.read'])
 def list_users():
     # Filters
     qtext = (request.args.get("q") or "").strip().lower()
@@ -270,7 +357,7 @@ def list_users():
 
 
 @bp.post("/invite")
-@jwt_required()
+@require_perms(['user.create'])
 def invite_user():
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
@@ -292,7 +379,8 @@ def invite_user():
 
 
 @bp.patch("/<int:uid>")
-@jwt_required()
+@require_perms(['user.update'])
+@within_scope('uid')
 def update_profile(uid: int):
     u = db.session.get(User, uid)
     if not u:
@@ -312,7 +400,8 @@ def update_profile(uid: int):
 
 
 @bp.post("/<int:uid>/roles")
-@jwt_required()
+@require_perms(['user.role.assign','user.scope.assign'])
+@within_scope('uid')
 def set_roles(uid: int):
     data = request.get_json(silent=True) or {}
     role_keys: List[str] = list(data.get("roles") or [])
@@ -343,7 +432,8 @@ def set_roles(uid: int):
 
 
 @bp.get("/<int:uid>/sessions")
-@jwt_required()
+@require_perms(['user.read'])
+@within_scope('uid')
 def list_sessions(uid: int):
     sess = db.session.query(UserSession).filter_by(user_id=uid).order_by(UserSession.created_at.desc()).all()
     return jsonify([
@@ -361,7 +451,8 @@ def list_sessions(uid: int):
 
 
 @bp.delete("/<int:uid>/sessions/<int:sid>")
-@jwt_required()
+@require_perms(['user.session.revoke'])
+@within_scope('uid')
 def revoke_session(uid: int, sid: int):
     s = db.session.get(UserSession, sid)
     if not s or s.user_id != uid:
@@ -373,7 +464,8 @@ def revoke_session(uid: int, sid: int):
 
 
 @bp.delete("/<int:uid>/sessions")
-@jwt_required()
+@require_perms(['user.session.revoke'])
+@within_scope('uid')
 def revoke_all_sessions(uid: int):
     q = db.session.query(UserSession).filter_by(user_id=uid, revoked=False)
     n = 0
@@ -386,7 +478,8 @@ def revoke_all_sessions(uid: int):
 
 
 @bp.post("/<int:uid>/password/reset")
-@jwt_required()
+@require_perms(['user.password.reset'])
+@within_scope('uid')
 def reset_password(uid: int):
     u = db.session.get(User, uid)
     if not u:
@@ -408,7 +501,8 @@ def reset_password(uid: int):
 
 
 @bp.get("/<int:uid>/audit")
-@jwt_required()
+@require_perms(['user.read'])
+@within_scope('uid')
 def user_audit(uid: int):
     module = (request.args.get("module") or "").strip().lower()
     since = _parse_since(request.args.get("since"))
@@ -431,7 +525,8 @@ def user_audit(uid: int):
 
 
 @bp.get("/<int:uid>/productivity")
-@jwt_required()
+@require_perms(['user.read'])
+@within_scope('uid')
 def productivity(uid: int):
     rng = (request.args.get("range") or "7d").lower()
     since = _parse_since(rng) or (_now_utc() - timedelta(days=7))
@@ -441,7 +536,8 @@ def productivity(uid: int):
 
 
 @bp.post("/<int:uid>/notifications")
-@jwt_required()
+@require_perms(['user.update'])
+@within_scope('uid')
 def set_notifications(uid: int):
     data = request.get_json(silent=True) or {}
     prefs = list(data.get("prefs") or [])
@@ -461,7 +557,7 @@ def set_notifications(uid: int):
 
 
 @bp.post("/export")
-@jwt_required()
+@require_perms(['user.export'])
 def export_users():
     # reuse filters from list
     role = (request.args.get("role") or "").strip().lower()
@@ -495,7 +591,8 @@ def export_users():
 # --- notes & files -----------------------------------------------------------
 
 @bp.get("/<int:uid>/notes")
-@jwt_required()
+@require_perms(['user.read'])
+@within_scope('uid')
 def get_notes(uid: int):
     rows = db.session.query(UserNote).filter_by(user_id=uid).order_by(UserNote.created_at.desc()).all()
     return jsonify([{
@@ -508,7 +605,8 @@ def get_notes(uid: int):
 
 
 @bp.post("/<int:uid>/notes")
-@jwt_required()
+@require_perms(['user.update'])
+@within_scope('uid')
 def add_note(uid: int):
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
@@ -522,7 +620,8 @@ def add_note(uid: int):
 
 
 @bp.delete("/<int:uid>/notes/<int:nid>")
-@jwt_required()
+@require_perms(['user.update'])
+@within_scope('uid')
 def delete_note(uid: int, nid: int):
     n = db.session.get(UserNote, nid)
     if not n or n.user_id != uid:
@@ -534,7 +633,8 @@ def delete_note(uid: int, nid: int):
 
 
 @bp.get("/<int:uid>/files")
-@jwt_required()
+@require_perms(['user.read'])
+@within_scope('uid')
 def get_files(uid: int):
     rows = db.session.query(UserFile).filter_by(user_id=uid).order_by(UserFile.created_at.desc()).all()
     return jsonify([{
@@ -548,7 +648,8 @@ def get_files(uid: int):
 
 
 @bp.post("/<int:uid>/files")
-@jwt_required()
+@require_perms(['user.update'])
+@within_scope('uid')
 def upload_file(uid: int):
     if 'file' not in request.files:
         return jsonify({"error": "file_required"}), 400
@@ -570,7 +671,8 @@ def upload_file(uid: int):
 
 
 @bp.delete("/<int:uid>/files/<int:fid>")
-@jwt_required()
+@require_perms(['user.update'])
+@within_scope('uid')
 def delete_file(uid: int, fid: int):
     rec = db.session.get(UserFile, fid)
     if not rec or rec.user_id != uid:
@@ -587,7 +689,8 @@ def delete_file(uid: int, fid: int):
 
 
 @bp.get("/<int:uid>/files/<int:fid>/download")
-@jwt_required()
+@require_perms(['user.read'])
+@within_scope('uid')
 def download_file(uid: int, fid: int):
     rec = db.session.get(UserFile, fid)
     if not rec or rec.user_id != uid:
@@ -599,7 +702,7 @@ def download_file(uid: int, fid: int):
 # --- CRUD and admin actions --------------------------------------------------
 
 @bp.post("")
-@jwt_required()
+@require_perms(['user.create'])
 def create_user():
     data = request.get_json(silent=True) or {}
     email = (data.get('email') or '').strip().lower()
@@ -633,7 +736,7 @@ def create_user():
 
 
 @bp.delete("/<int:uid>")
-@jwt_required()
+@require_perms(['user.delete_soft'])
 def soft_delete(uid: int):
     u = db.session.get(User, uid)
     if not u:
@@ -646,7 +749,7 @@ def soft_delete(uid: int):
 
 
 @bp.post("/<int:uid>/lock")
-@jwt_required()
+@require_perms(['user.status.lock'])
 def lock_user(uid: int):
     u = db.session.get(User, uid)
     if not u:
@@ -658,7 +761,7 @@ def lock_user(uid: int):
 
 
 @bp.post("/<int:uid>/unlock")
-@jwt_required()
+@require_perms(['user.status.lock'])
 def unlock_user(uid: int):
     u = db.session.get(User, uid)
     if not u:
@@ -672,7 +775,8 @@ def unlock_user(uid: int):
 
 
 @bp.post("/<int:uid>/password/change")
-@jwt_required()
+@require_perms(['user.update'])
+@within_scope('uid')
 def change_password(uid: int):
     data = request.get_json(silent=True) or {}
     old = data.get('old_password') or ''
@@ -695,7 +799,7 @@ def change_password(uid: int):
 # Unified bulk and import -----------------------------------------------------
 
 @bp.post("/bulk")
-@jwt_required()
+@require_perms(['user.bulk'])
 def bulk():
     data = request.get_json(silent=True) or {}
     action = str(data.get('action') or '').strip()
@@ -756,7 +860,7 @@ def bulk():
 
 
 @bp.post("/import")
-@jwt_required()
+@require_perms(['user.import'])
 def import_users():
     dry = str(request.args.get('dry_run') or request.form.get('dry_run') or '0').lower() in ('1','true','yes','on')
     f = request.files.get('file')
