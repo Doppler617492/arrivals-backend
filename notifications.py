@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity, get_jwt
 from datetime import datetime
+from sqlalchemy import or_, and_
 
 from extensions import db
 from models import Notification
@@ -52,7 +53,14 @@ def list_notifications():
         except Exception:
             pass
 
-    items = q.order_by(Notification.created_at.desc()).limit(limit).all()
+    since_id = request.args.get("since_id")
+    if since_id:
+        try:
+            since_id = int(since_id)
+            q = q.filter(Notification.id > since_id)
+        except Exception:
+            since_id = None
+    items = q.order_by(Notification.id.asc() if since_id else Notification.created_at.desc()).limit(limit).all()
 
     # Augment with a navigate_url convention for the UI
     out = []
@@ -64,6 +72,46 @@ def list_notifications():
             d['navigate_url'] = f"/containers#{n.entity_id}"
         out.append(d)
     return jsonify(out)
+
+
+@bp.get("/stream")
+def stream_notifications_sse():
+    from flask import Response
+    import time
+
+    def gen():
+        try:
+            since_id = request.args.get('since_id')
+            try:
+                since = int(since_id) if since_id else 0
+            except Exception:
+                since = 0
+            # First batch: send any pending since_id
+            initial = Notification.query.filter(Notification.id > since).order_by(Notification.id.asc()).limit(200).all()
+            for n in initial:
+                payload = n.to_dict()
+                yield f"event: notifications.created\nid: {n.id}\ndata: {json.dumps(payload)}\n\n"
+                since = int(n.id)
+            # Polling loop (lightweight)
+            while True:
+                time.sleep(2)
+                newer = Notification.query.filter(Notification.id > since).order_by(Notification.id.asc()).limit(200).all()
+                for n in newer:
+                    payload = n.to_dict()
+                    yield f"event: notifications.created\nid: {n.id}\ndata: {json.dumps(payload)}\n\n"
+                    since = int(n.id)
+        except GeneratorExit:
+            return
+        except Exception:
+            return
+
+    headers = {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    }
+    return Response(gen(), headers=headers)
 
 
 @bp.get("/count")
@@ -78,6 +126,54 @@ def count_notifications():
     except Exception:
         n = 0
     return jsonify({'count': n, 'unread': bool(unread)})
+
+
+@bp.post("/bulk_delete")
+def bulk_delete_notifications():
+    """Delete notifications in bulk.
+    Body: { unread: boolean } — when true, deletes only unread; otherwise deletes all accessible notifications.
+    Returns: { ok: true, deleted_count: number }
+    """
+    try:
+        verify_jwt_in_request(optional=True)
+    except Exception:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    uid, claims = _current_user()
+    claims = claims or {}
+    user_role = claims.get('role')
+    if uid is None and user_role is None:
+        # An authenticated principal must be identifiable either by id or role.
+        return jsonify({'error': 'Forbidden'}), 403
+
+    payload = (request.get_json(silent=True) or {})
+    unread_only = str(payload.get('unread', '')).lower() in ('1','true','yes','on')
+
+    try:
+        q = Notification.query
+        if unread_only:
+            q = q.filter(Notification.read.is_(False))
+
+        if user_role != 'admin':
+            allowed_filters = []
+            if uid is not None:
+                allowed_filters.append(Notification.user_id == uid)
+            if user_role:
+                allowed_filters.append(and_(Notification.user_id.is_(None), Notification.role == user_role))
+            # Global notifications without explicit ownership stay deletable, matching single-delete behaviour.
+            allowed_filters.append(and_(Notification.user_id.is_(None), Notification.role.is_(None)))
+            q = q.filter(or_(*allowed_filters))
+
+        deleted_count = q.delete(synchronize_session=False)
+        db.session.commit()
+        try:
+            ws_broadcast({'type':'notifications.bulk','resource':'notifications','action':'deleted','count':int(deleted_count),'v':1,'ts':datetime.utcnow().isoformat()+'Z'})
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'deleted_count': int(deleted_count)})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error':'delete_failed','detail':str(e)}), 500
 
 
 @bp.post("")
@@ -201,58 +297,3 @@ def open_notification(nid: int):
     n.read = True
     db.session.commit()
     return jsonify({'ok': True})
-
-
-@bp.post("/bulk_delete")
-def bulk_delete_notifications():
-    uid, claims = _current_user()
-    payload = request.get_json(silent=True) or {}
-    all_flag = bool(payload.get('all'))
-    unread_only = bool(payload.get('unread'))
-    user_role = (claims or {}).get('role')
-    deleted: list[int] = []
-
-    if all_flag:
-        q = Notification.query
-        if unread_only:
-            q = q.filter(Notification.read.is_(False))
-        # Scope by permissions
-        if user_role == 'admin':
-            # Admin clears everything (respecting unread filter if set)
-            ids = [int(r.id) for r in q.with_entities(Notification.id).all()]
-            if ids:
-                Notification.query.filter(Notification.id.in_(ids)).delete(synchronize_session=False)
-                deleted.extend(ids)
-        else:
-            # Non-admin: only own or role-targeted
-            own_q = q.filter(Notification.user_id == uid)
-            role_q = q.filter(Notification.user_id.is_(None), Notification.role == user_role)
-            ids = [int(r.id) for r in own_q.with_entities(Notification.id).all()]
-            ids += [int(r.id) for r in role_q.with_entities(Notification.id).all()]
-            if ids:
-                Notification.query.filter(Notification.id.in_(ids)).delete(synchronize_session=False)
-                deleted.extend(ids)
-    else:
-        ids = payload.get('ids') or []
-        if not isinstance(ids, list):
-            return jsonify({'error': 'ids must be an array'}), 400
-        if not ids:
-            return jsonify({'ok': True, 'deleted': []})
-        rows = Notification.query.filter(Notification.id.in_(ids)).all()
-        for n in rows:
-            # Admin can delete anything
-            if user_role == 'admin':
-                db.session.delete(n); deleted.append(int(n.id)); continue
-            # Owner can delete own
-            if n.user_id is not None and uid == n.user_id:
-                db.session.delete(n); deleted.append(int(n.id)); continue
-            # Role-targeted can be deleted by same-role users
-            if n.user_id is None and n.role is not None and user_role == n.role:
-                db.session.delete(n); deleted.append(int(n.id)); continue
-    if deleted:
-        db.session.commit()
-        try:
-            ws_broadcast({'type':'notifications.bulk','resource':'notifications','action':'deleted','ids':deleted,'v':1,'ts':datetime.utcnow().isoformat()+'Z'})
-        except Exception:
-            pass
-    return jsonify({'ok': True, 'deleted': deleted})

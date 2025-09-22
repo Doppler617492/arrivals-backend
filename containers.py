@@ -115,7 +115,7 @@ def create_container():
             supplier = (c.supplier or '').strip()
             title = (c.container_no or '').strip() or supplier
             txt = f"Novi kontejner (#{c.id}{' – ' + title if title else ''})"
-            notify(txt, ntype='info', entity_type='container', entity_id=c.id)
+            notify(txt, ntype='info', event='CREATED', dedup_key=f"container:{c.id}:created", entity_type='container', entity_id=c.id)
         except Exception:
             pass
         try:
@@ -192,6 +192,15 @@ def update_container(id):
         c.arrived_at = _parse_iso(data.get("arrived_at"))
     try:
         db.session.commit()
+        try:
+            if 'status' in data:
+                s = str(data.get('status'))
+                today = datetime.utcnow().strftime('%Y%m%d')
+                notify(f"Promjena statusa kontejnera (#{c.id}) → {s}", ntype='info', event='STATUS_CHANGED', dedup_key=f"container:{c.id}:status:{s}:{today}", entity_type='container', entity_id=c.id)
+            if 'paid' in data:
+                notify(f"Plaćanje ažurirano (#{c.id}) → {'plaćeno' if c.paid else 'nije plaćeno'}", ntype='info', entity_type='container', entity_id=c.id)
+        except Exception:
+            pass
         try:
             ws_broadcast({
                 'type': 'containers.updated',
@@ -273,6 +282,10 @@ def set_paid(id):
         pass
     try:
         db.session.commit()
+        try:
+            notify(f"Plaćanje ažurirano (#{c.id}) → {'plaćeno' if is_paid else 'nije plaćeno'}", ntype='info', entity_type='container', entity_id=c.id)
+        except Exception:
+            pass
         d = c.to_dict()
         try:
             ws_broadcast({
@@ -286,7 +299,7 @@ def set_paid(id):
             })
         except Exception:
             pass
-    return jsonify(d)
+        return jsonify(d)
 
 @bp.post("/admin/wipe")
 def admin_wipe_containers():

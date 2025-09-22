@@ -182,6 +182,7 @@ if ENFORCE_HTTPS:
 
 # --- Optional WebSocket support (Flask-Sock) ---
 WS_CLIENTS = set()
+WS_META = {}
 try:
     from flask_sock import Sock
     sock = Sock(app)
@@ -194,9 +195,17 @@ try:
             # NOTE: For dev we don't enforce JWT here; use a reverse proxy for auth in prod.
             params = request.args or {}
             topics = (params.get('topics') or '').split(',') if params.get('topics') else []
+            try:
+                since_id = int(params.get('since_id') or 0)
+            except Exception:
+                since_id = 0
 
             # Register this client
             WS_CLIENTS.add(ws)
+            WS_META[ws] = {
+                'topics': set([t for t in topics if t]),
+                'since_id': int(since_id or 0),
+            }
             # Send a hello/heartbeat so client knows it’s connected
             try:
                 ws.send(json.dumps({
@@ -226,6 +235,7 @@ try:
         finally:
             try:
                 WS_CLIENTS.discard(ws)
+                WS_META.pop(ws, None)
             except Exception:
                 pass
 except Exception as _ws_err:
@@ -243,6 +253,25 @@ def ws_broadcast(event: dict):
     dead = []
     for client in list(WS_CLIENTS):
         try:
+            meta = WS_META.get(client) or {}
+            topics = meta.get('topics') or set()
+            # If client subscribed to specific topics, filter by resource/topic
+            if topics:
+                res = str(event.get('resource') or '').lower()
+                typ = str(event.get('type') or '').lower()
+                if res and (res not in topics) and ('notifications' in topics and res != 'notifications'):
+                    # Also allow shorthand where type startswith topic
+                    if not any(typ.startswith(f"{t}.") for t in topics):
+                        continue
+            # For notifications, enforce since_id gate if provided
+            if (str(event.get('resource')) == 'notifications' or str(event.get('type')).startswith('notifications.')) and 'id' in event:
+                try:
+                    sid = int(meta.get('since_id') or 0)
+                    eid = int(event.get('id'))
+                    if sid and eid <= sid:
+                        continue
+                except Exception:
+                    pass
             client.send(payload)
         except Exception:
             dead.append(client)
@@ -252,14 +281,53 @@ def ws_broadcast(event: dict):
         except Exception:
             pass
 
-def notify(text: str, *, ntype: str = 'info', entity_type: str | None = None, entity_id: int | None = None, user_id: int | None = None, role: str | None = None):
+def notify(text: str, *, ntype: str = 'info', event: str | None = None, dedup_key: str | None = None, entity_type: str | None = None, entity_id: int | None = None, user_id: int | None = None, role: str | None = None):
     """Create, persist and broadcast a notification.
     Emits WS event 'notifications.created'. Safe to call anywhere; rolls back on failure.
     """
     try:
-        n = Notification(user_id=user_id, role=role, type=ntype, entity_type=entity_type, entity_id=entity_id, text=text, read=False)
-        db.session.add(n)
-        db.session.commit()
+        if dedup_key:
+            # Try UPSERT by dedup_key; works on Postgres/SQLite (>=3.24.0)
+            try:
+                ins = text(
+                    """
+                    INSERT INTO notifications (dedup_key, user_id, role, type, event, entity_type, entity_id, text, read, created_at)
+                    VALUES (:dedup_key, :user_id, :role, :type, :event, :entity_type, :entity_id, :text, :read, :created_at)
+                    ON CONFLICT (dedup_key) DO NOTHING
+                    RETURNING id
+                    """
+                )
+                now = datetime.utcnow()
+                res = db.session.execute(ins, {
+                    'dedup_key': dedup_key,
+                    'user_id': user_id,
+                    'role': role,
+                    'type': ntype,
+                    'event': event,
+                    'entity_type': entity_type,
+                    'entity_id': entity_id,
+                    'text': text,
+                    'read': False,
+                    'created_at': now,
+                })
+                row = res.fetchone()
+                if not row:
+                    db.session.rollback()
+                    return None
+                nid = int(row[0])
+                n = Notification.query.get(nid)
+            except Exception:
+                # Fallback: select by dedup_key; if exists, skip; otherwise normal insert
+                existing = Notification.query.filter_by(dedup_key=dedup_key).first()
+                if existing:
+                    return None
+                n = Notification(user_id=user_id, role=role, type=ntype, event=event, entity_type=entity_type, entity_id=entity_id, text=text, read=False, dedup_key=dedup_key)
+                db.session.add(n)
+                db.session.commit()
+        else:
+            n = Notification(user_id=user_id, role=role, type=ntype, event=event, entity_type=entity_type, entity_id=entity_id, text=text, read=False)
+            db.session.add(n)
+            db.session.commit()
         try:
             ws_broadcast({
                 'type': 'notifications.created',
@@ -1098,6 +1166,23 @@ if os.environ.get('AUTO_CREATE_TABLES', '1').lower() in ('1','true','yes','on'):
                         print('[BOOTSTRAP] Added arrivals.category')
                 except Exception as e:
                     print('[BOOTSTRAP] Inspect/add arrivals.category skipped:', e)
+                # Ensure notifications.event & dedup_key
+                try:
+                    n_cols = [c['name'] for c in insp.get_columns('notifications')]
+                    if 'event' not in n_cols:
+                        db.session.execute(text("ALTER TABLE notifications ADD COLUMN event VARCHAR(64)"))
+                        db.session.commit()
+                        print('[BOOTSTRAP] Added notifications.event')
+                    if 'dedup_key' not in n_cols:
+                        db.session.execute(text("ALTER TABLE notifications ADD COLUMN dedup_key VARCHAR(255)"))
+                        try:
+                            db.session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_dedup_key ON notifications (dedup_key)"))
+                        except Exception:
+                            pass
+                        db.session.commit()
+                        print('[BOOTSTRAP] Added notifications.dedup_key')
+                except Exception as e:
+                    print('[BOOTSTRAP] Inspect/add notifications columns skipped:', e)
                 # Migrate legacy plaintext passwords
                 try:
                     from werkzeug.security import generate_password_hash
@@ -2906,17 +2991,9 @@ def sla_monitor_loop():
                                 continue
                             if eta_date < today:
                                 # Prevent spamming: skip if we already have a warning for this arrival
-                                existing = (
-                                    db.session.query(Notification)
-                                    .filter(
-                                        Notification.entity_type == 'arrival',
-                                        Notification.entity_id == a.id,
-                                        Notification.type == 'warning'
-                                    )
-                                    .first()
-                                )
-                                if not existing:
-                                    notify(f"Dolazak kasni (#{a.id})", ntype='warning', entity_type='arrival', entity_id=a.id)
+                                # Dedup by date
+                                key = f"arrival:{a.id}:deadline:{today.strftime('%Y%m%d')}"
+                                notify(f"Dolazak kasni (#{a.id})", ntype='warning', event='DEADLINE_BREACHED', dedup_key=key, entity_type='arrival', entity_id=a.id)
                         except Exception:
                             continue
                 except Exception as _late_err:
@@ -2936,17 +3013,8 @@ def sla_monitor_loop():
                                 continue
                             # c.eta is a date already
                             if eta < today:
-                                existing = (
-                                    db.session.query(Notification)
-                                    .filter(
-                                        Notification.entity_type == 'container',
-                                        Notification.entity_id == c.id,
-                                        Notification.type == 'warning'
-                                    )
-                                    .first()
-                                )
-                                if not existing:
-                                    notify(f"Kontejner kasni (#{c.id})", ntype='warning', entity_type='container', entity_id=c.id)
+                                key = f"container:{c.id}:deadline:{today.strftime('%Y%m%d')}"
+                                notify(f"Kontejner kasni (#{c.id})", ntype='warning', event='DEADLINE_BREACHED', dedup_key=key, entity_type='container', entity_id=c.id)
                         except Exception:
                             continue
                 except Exception as _late2_err:
@@ -2975,17 +3043,8 @@ def sla_monitor_loop():
                             if not pd_date:
                                 continue
                             if pd_date < today:
-                                existing = (
-                                    db.session.query(Notification)
-                                    .filter(
-                                        Notification.entity_type=='arrival',
-                                        Notification.entity_id==a.id,
-                                        Notification.type=='warning',
-                                        Notification.text.ilike('%pickup%')
-                                    ).first()
-                                )
-                                if not existing:
-                                    notify(f"Pickup kasni (#{a.id})", ntype='warning', entity_type='arrival', entity_id=a.id)
+                                key = f"arrival:{a.id}:deadline:{today.strftime('%Y%m%d')}"
+                                notify(f"Pickup kasni (#{a.id})", ntype='warning', event='DEADLINE_BREACHED', dedup_key=key, entity_type='arrival', entity_id=a.id)
                         except Exception:
                             continue
                 except Exception as _late3_err:

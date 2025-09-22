@@ -73,10 +73,12 @@ class Notification(db.Model):
     user_id     = db.Column(db.Integer, index=True, nullable=True)  # null = global
     role        = db.Column(db.String(64), nullable=True, index=True)  # null = all roles; otherwise visible to role
     type        = db.Column(db.String(64), default="info")         # info|warning|error|success
+    event       = db.Column(db.String(64), index=True)              # CREATED|STATUS_CHANGED|DEADLINE_BREACHED|...
     entity_type = db.Column(db.String(64), nullable=True)           # arrival|container|...
     entity_id   = db.Column(db.Integer, nullable=True)
     text        = db.Column(db.Text, nullable=False)
     read        = db.Column(db.Boolean, default=False, index=True)
+    dedup_key   = db.Column(db.String(255), unique=True, index=True)
     created_at  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
     def to_dict(self):
@@ -85,10 +87,12 @@ class Notification(db.Model):
             'user_id': self.user_id,
             'role': self.role,
             'type': self.type,
+            'event': self.event,
             'entity_type': self.entity_type,
             'entity_id': self.entity_id,
             'text': self.text,
             'read': bool(self.read),
+            'dedup_key': self.dedup_key,
             'created_at': (self.created_at or datetime.utcnow()).isoformat(),
         }
 

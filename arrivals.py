@@ -109,6 +109,15 @@ def create_arrival():
     )
     db.session.add(a); db.session.commit()
     try:
+        # CREATED notification with dedup key
+        from app import notify
+        notify(
+            f"Novi dolazak (#{a.id}{' – ' + (a.supplier or '').strip() if (a.supplier or '').strip() else ''})",
+            ntype='info', event='CREATED', dedup_key=f"arrival:{a.id}:created", entity_type='arrival', entity_id=a.id
+        )
+    except Exception:
+        pass
+    try:
         ws_broadcast({
             'type': 'arrivals.created',
             'resource': 'arrivals',
@@ -195,6 +204,15 @@ def update_arrival_status(id):
     if 'status' in data:
         msg=f"Status changed to '{data['status']}'"
         db.session.add(ArrivalUpdate(arrival_id=a.id,user_id=user_id,message=msg))
+        try:
+            from app import notify
+            today = datetime.utcnow().strftime('%Y%m%d')
+            notify(
+                f"Promjena statusa dolaska (#{a.id}) → {data['status']}",
+                ntype='info', event='STATUS_CHANGED', dedup_key=f"arrival:{a.id}:status:{data['status']}:{today}", entity_type='arrival', entity_id=a.id
+            )
+        except Exception:
+            pass
         if NOTIFY_ON_STATUS:
             try:
                 send_email(
