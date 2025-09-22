@@ -128,9 +128,21 @@ _configure_logging()
 # Allowed CORS origins (env override via ALLOWED_ORIGINS)
 ALLOWED_ORIGINS = allowed_origins()
 
+
 # Core blueprint (enabled now that overlapping routes are removed)
 from routes.core import bp as core_bp
 app.register_blueprint(core_bp, url_prefix="")
+
+# Arrivals blueprint (ensures DELETE /api/arrivals/<id> is active)
+try:
+    from arrivals import bp as arrivals_bp  # arrivals.py defines this blueprint
+    app.register_blueprint(arrivals_bp, url_prefix="/api/arrivals")
+    print('[BOOT] Arrivals blueprint registered at /api/arrivals')
+except Exception as _arr_bp_err:
+    try:
+        print('[BOOT] Arrivals blueprint NOT registered – DELETE may return 405:', _arr_bp_err)
+    except Exception:
+        pass
 
 
 
@@ -1515,11 +1527,58 @@ def arrivals_update_fallback(aid):
         db.session.rollback()
         return jsonify({"error": "update_failed", "detail": str(e)}), 500
 
-# Fallback: delete a single arrival (DISABLED; use arrivals blueprint route)
-# @app.route('/api/arrivals/<int:aid>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
-def arrivals_delete_fallback_disabled(aid):
-    """Disabled fallback to avoid shadowing blueprint DELETE route."""
-    return jsonify({'error': 'disabled'}), 404
+# Fallback: delete a single arrival (accepts JWT for any user; mirrors blueprint behaviour)
+@app.route('/api/arrivals/<int:aid>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
+def arrivals_delete_fallback(aid):
+    # CORS preflight
+    if request.method == 'OPTIONS':
+        origin = request.headers.get("Origin")
+        headers = {}
+        if origin in (ALLOWED_ORIGINS or []):
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+            headers["Access-Control-Allow-Credentials"] = "true"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+        return ("", 204, headers)
+
+    # Require JWT (no role check)
+    try:
+        verify_jwt_in_request(optional=False)
+    except Exception:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    a = Arrival.query.get(aid)
+    if not a:
+        return jsonify({'error': 'Not found'}), 404
+
+    try:
+        # Remove files best-effort
+        try:
+            for f in list(getattr(a, 'files', []) or []):
+                try:
+                    os.remove(os.path.join(app.config.get('UPLOAD_FOLDER') or '', f.filename))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        db.session.delete(a)
+        db.session.commit()
+        try:
+            ws_broadcast({
+                'type': 'arrivals.deleted',
+                'resource': 'arrivals',
+                'action': 'deleted',
+                'id': int(aid),
+                'v': 1,
+                'ts': datetime.utcnow().isoformat() + 'Z',
+            })
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'id': int(aid)}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': 'delete_failed', 'detail': str(e)}), 500
 
 # Fallback: explicit status endpoint (helps clients that can't PATCH reliably)
 @app.route('/api/arrivals/<int:aid>/status', methods=['POST', 'OPTIONS'], strict_slashes=False)
