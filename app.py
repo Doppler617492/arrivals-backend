@@ -1515,6 +1515,61 @@ def arrivals_update_fallback(aid):
         db.session.rollback()
         return jsonify({"error": "update_failed", "detail": str(e)}), 500
 
+# Fallback: delete a single arrival (when blueprint isn't active)
+@app.route('/api/arrivals/<int:aid>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
+def arrivals_delete_fallback(aid):
+    if request.method == 'OPTIONS':
+        origin = request.headers.get("Origin")
+        headers = {}
+        if origin in (ALLOWED_ORIGINS or []):
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+            headers["Access-Control-Allow-Credentials"] = "true"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+        return ("", 204, headers)
+
+    # Accept either API key or admin JWT (mirrors blueprint semantics)
+    if not has_valid_api_key():
+        try:
+            verify_jwt_in_request(optional=False)
+        except Exception:
+            return jsonify({'error': 'Unauthorized'}), 401
+        claims = get_jwt()
+        if (claims or {}).get('role') != 'admin':
+            return jsonify({'error': 'Admin only'}), 403
+
+    a = Arrival.query.get(aid)
+    if not a:
+        return jsonify({'error': 'Not found'}), 404
+    try:
+        # Best-effort remove associated files from disk
+        try:
+            for f in list(getattr(a, 'files', []) or []):
+                try:
+                    os.remove(os.path.join(app.config.get('UPLOAD_FOLDER') or '', f.filename))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        db.session.delete(a)
+        db.session.commit()
+        try:
+            ws_broadcast({
+                'type': 'arrivals.deleted',
+                'resource': 'arrivals',
+                'action': 'deleted',
+                'id': int(aid),
+                'v': 1,
+                'ts': datetime.utcnow().isoformat() + 'Z',
+            })
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'id': int(aid)}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': 'delete_failed', 'detail': str(e)}), 500
+
 # Fallback: explicit status endpoint (helps clients that can't PATCH reliably)
 @app.route('/api/arrivals/<int:aid>/status', methods=['POST', 'OPTIONS'], strict_slashes=False)
 def arrivals_status_fallback(aid):
