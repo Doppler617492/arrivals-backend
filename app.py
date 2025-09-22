@@ -1527,9 +1527,11 @@ def arrivals_update_fallback(aid):
         db.session.rollback()
         return jsonify({"error": "update_failed", "detail": str(e)}), 500
 
-# Fallback: delete a single arrival (accepts JWT for any user; mirrors blueprint behaviour)
-@app.route('/api/arrivals/<int:aid>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
+# Fallback: delete a single arrival (DISABLED to avoid shadowing blueprint)
+# @app.route('/api/arrivals/<int:aid>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 def arrivals_delete_fallback(aid):
+    return jsonify({'error': 'disabled'}), 404
+    # Below kept for parity reference; not active.
     # CORS preflight
     if request.method == 'OPTIONS':
         origin = request.headers.get("Origin")
@@ -3156,6 +3158,26 @@ _register_blueprint(["routes.users_enterprise", "routes.enterprise_users"], labe
 
 # Arrivals blueprint
 _register_blueprint(["routes.arrivals", "arrivals"], label="arrivals")
+
+# Ensure arrivals blueprint DELETE route is present; if not, explicitly register
+try:
+    def _has_arrivals_delete():
+        try:
+            for r in app.url_map.iter_rules():
+                if str(r) == '/api/arrivals/<int:id>' and ('DELETE' in (r.methods or set())):
+                    return True
+        except Exception:
+            return False
+        return False
+    if not _has_arrivals_delete():
+        try:
+            from arrivals import bp as arrivals_bp
+            app.register_blueprint(arrivals_bp, url_prefix='/api/arrivals')
+            print('[BOOT] Explicitly registered arrivals blueprint')
+        except Exception as _explicit_err:
+            print('[BOOT] Explicit arrivals blueprint register failed:', _explicit_err)
+except Exception as _ensure_err:
+    print('[BOOT] arrivals ensure failed:', _ensure_err)
 
 # Containers blueprint
 # The 'containers' blueprint in containers.py already defines url_prefix='/api/containers'.
