@@ -245,27 +245,41 @@ def update_arrival_status(id):
         pass
     return jsonify(a.to_dict())
 
-@bp.delete("/<int:id>")
-@jwt_required(optional=True)
+@bp.route("/<int:id>", methods=["DELETE", "OPTIONS"], strict_slashes=False)
 def delete_arrival(id):
-    if not (has_valid_api_key()):
-        try: verify_jwt_in_request(optional=False)
-        except Exception: return jsonify({'error':'Unauthorized'}),401
-        claims=get_jwt()
-        if (claims or {}).get('role')!='admin': return jsonify({'error':'Admin only'}),403
-    a=Arrival.query.get(id)
-    if not a: return jsonify({'error':'Not found'}),404
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        return ("", 204)
+    # Require JWT for all users; no admin role check
     try:
-        for f in list(getattr(a,"files",[]) or []):
-            try: os.remove(os.path.join(current_app.config['UPLOAD_FOLDER'],f.filename))
-            except Exception: pass
-    except Exception: pass
-    db.session.delete(a); db.session.commit()
+        verify_jwt_in_request(optional=False)
+    except Exception:
+        return jsonify({'error': 'Unauthorized'}), 401
+    a = Arrival.query.get(id)
+    if not a:
+        return jsonify({'error': 'Not found'}), 404
+    # Hard delete + best-effort remove files
     try:
-        from app import notify
-        notify(f"Dolazak obrisan (#{id})", ntype='warning', entity_type='arrival', entity_id=id)
+        for f in list(getattr(a, 'files', []) or []):
+            try:
+                os.remove(os.path.join(current_app.config['UPLOAD_FOLDER'], f.filename))
+            except Exception:
+                pass
     except Exception:
         pass
+    db.session.delete(a)
+    db.session.commit()
+    # Optional audit log
+    try:
+        uid = get_jwt_identity()
+        msg = f"arrival:{id} deleted_by:{uid}"
+        try:
+            current_app.logger.info('[AUDIT] ' + msg)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Broadcast realtime event so UI can remove card without refetch
     try:
         ws_broadcast({
             'type': 'arrivals.deleted',
@@ -277,7 +291,7 @@ def delete_arrival(id):
         })
     except Exception:
         pass
-    return jsonify({'ok':True,'deleted_id':id}),200
+    return jsonify({'ok': True, 'id': int(id)}), 200
 
 @bp.delete("/bulk_delete")
 @jwt_required(optional=True)
