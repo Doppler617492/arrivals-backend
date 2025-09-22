@@ -102,6 +102,8 @@ class Arrival(db.Model):
     plate          = db.Column(db.String(64))
     driver         = db.Column(db.String(255))
     type           = db.Column(db.String(32), default="truck")
+    # New: simple category tag (frontend uses fixed options; free text allowed)
+    category       = db.Column(db.String(255))
     eta            = db.Column(db.String(64))  # keep string as in existing API
     status         = db.Column(db.String(64), default="not_shipped", index=True)
     note           = db.Column(db.Text)
@@ -136,6 +138,7 @@ class Arrival(db.Model):
             "plate": self.plate or "",
             "driver": self.driver or "",
             "type": self.type or "truck",
+            "category": self.category or "",
             "eta": self.eta or "",
             "status": self.status or "not_shipped",
             "note": self.note or "",

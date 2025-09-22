@@ -98,6 +98,7 @@ def create_arrival():
     a = Arrival(
         supplier=data.get('supplier'), carrier=data.get('carrier'), plate=data.get('plate'),
         driver=data.get('driver'), pickup_date=_parse_iso(data.get('pickup_date')), type=data.get('type','truck'),
+        category=(data.get('category') or None),
         eta=data.get('eta'), status=data.get('status','not_shipped'), note=data.get('note'),
         order_date=_parse_iso(data.get('order_date')), production_due=_parse_iso(data.get('production_due')),
         shipped_at=_parse_iso(data.get('shipped_at')), arrived_at=_parse_iso(data.get('arrived_at')),
@@ -142,7 +143,7 @@ def update_arrival(id):
         elif 'assignee' in data and can_set('responsible'): data['responsible']=data.get('assignee')
     for _k in ('responsible','location'):
         if _k in data and isinstance(data[_k],str): data[_k]=data[_k].strip()
-    for field in ['supplier','carrier','plate','driver','type','eta','status','note','customs_info','currency','assignee_id','responsible','location']:
+    for field in ['supplier','carrier','plate','driver','type','eta','status','note','customs_info','currency','assignee_id','responsible','location','category']:
         if field in data and can_set(field): setattr(a,field,data[field])
     if 'order_date' in data and can_set('order_date'): a.order_date=_parse_iso(data.get('order_date'))
     if 'production_due' in data and can_set('production_due'): a.production_due=_parse_iso(data.get('production_due'))

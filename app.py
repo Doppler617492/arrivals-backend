@@ -2,11 +2,22 @@ from flask import Flask, request, jsonify, send_from_directory, redirect
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from flask_jwt_extended import (
-    JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt, verify_jwt_in_request
+    JWTManager,
+    create_access_token,
+    create_refresh_token,
+    jwt_required,
+    get_jwt_identity,
+    get_jwt,
+    verify_jwt_in_request,
+    set_access_cookies,
+    set_refresh_cookies,
+    unset_jwt_cookies,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+import http.cookiejar
 from sqlalchemy.orm import relationship
 from sqlalchemy import or_, text, func
 from functools import wraps
@@ -16,7 +27,14 @@ import threading
 import smtplib
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
+import logging
+import structlog
 import json
+import base64
+import ssl
+import urllib.request
+import urllib.error
+import urllib.parse
 
 # Optional/legacy modules (guarded so app can start even if they don't exist)
 try:
@@ -75,6 +93,38 @@ except Exception:
 
 app = Flask(__name__)
 
+# --- Logging (JSON/structured) ---
+def _configure_logging():
+    try:
+        timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
+        structlog.configure(
+            processors=[
+                structlog.processors.add_log_level,
+                timestamper,
+                structlog.processors.StackInfoRenderer(),
+                structlog.processors.format_exc_info,
+                structlog.processors.JSONRenderer(),
+            ],
+            wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+            context_class=dict,
+            cache_logger_on_first_use=True,
+        )
+        # Bridge stdlib logging to structlog
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        root = logging.getLogger()
+        root.handlers = [handler]
+        root.setLevel(logging.INFO)
+        # Example startup log
+        structlog.get_logger("startup").info("backend_boot", pid=os.getpid())
+    except Exception as _log_err:
+        try:
+            print("[LOG] structlog setup failed:", _log_err)
+        except Exception:
+            pass
+
+_configure_logging()
+
 # Allowed CORS origins (env override via ALLOWED_ORIGINS)
 ALLOWED_ORIGINS = allowed_origins()
 
@@ -99,6 +149,36 @@ CORS(
     expose_headers=["Content-Type", "Authorization"],
     max_age=86400,
 )
+
+# Optional HTTPS enforcement and secure headers
+ENFORCE_HTTPS = (os.environ.get('ENFORCE_HTTPS', '0').lower() in ('1','true','yes','on'))
+
+if ENFORCE_HTTPS:
+    @app.before_request
+    def _force_https_redirect():
+        try:
+            # Respect reverse proxy header, fallback to request.is_secure
+            xf_proto = request.headers.get('X-Forwarded-Proto', '').lower()
+            is_secure = request.is_secure or (xf_proto == 'https')
+            # Allow local dev without TLS
+            host = (request.host or '').split(':')[0]
+            local = host in ('127.0.0.1', 'localhost')
+            if not is_secure and not local:
+                url = request.url.replace('http://', 'https://', 1)
+                return redirect(url, code=308)
+        except Exception:
+            pass
+
+    @app.after_request
+    def _hsts_headers(resp):
+        try:
+            resp.headers.setdefault('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload')
+            resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+            resp.headers.setdefault('X-Frame-Options', 'DENY')
+            resp.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+        except Exception:
+            pass
+        return resp
 
 # --- Optional WebSocket support (Flask-Sock) ---
 WS_CLIENTS = set()
@@ -207,7 +287,7 @@ if os.environ.get('LOG_HTTP', '').lower() in ('1','true','yes','on'):
     def _http_log_begin():
         try:
             g._t0 = time.time()
-            print(f"[HTTP] -> {request.method} {request.path}")
+            structlog.get_logger("http").info("request_in", method=request.method, path=request.path)
         except Exception:
             pass
     @app.after_request
@@ -216,7 +296,9 @@ if os.environ.get('LOG_HTTP', '').lower() in ('1','true','yes','on'):
             t0 = getattr(g, '_t0', None)
             if t0:
                 dt = (time.time() - t0) * 1000.0
-                print(f"[HTTP] <- {request.method} {request.path} {resp.status_code} in {dt:.1f}ms")
+                structlog.get_logger("http").info(
+                    "request_out", method=request.method, path=request.path, status=resp.status_code, ms=round(dt,1)
+                )
         except Exception:
             pass
         return resp
@@ -351,6 +433,632 @@ def _method_not_allowed(e):
 def _too_large(e):
     return jsonify({"error": "File too large"}), 413
 
+# --- Auth: Cookie-based JWT (opt-in) ---
+@app.route('/auth/login-cookie', methods=['POST', 'OPTIONS'])
+def auth_login_cookie():
+    if request.method == 'OPTIONS':
+        return ("", 204)
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        email = (data.get('email') or '').strip().lower()
+        password = (data.get('password') or '')
+        if not email or not password:
+            return jsonify({'error': 'Email and password required'}), 400
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            return jsonify({'error': 'Invalid credentials'}), 401
+        ok = False
+        if hasattr(user, 'check_password') and callable(getattr(user, 'check_password')):
+            ok = user.check_password(password)
+        elif hasattr(user, 'password_hash'):
+            try:
+                ok = check_password_hash(user.password_hash, password)
+            except Exception:
+                ok = False
+        elif hasattr(user, 'password'):
+            ok = (getattr(user, 'password') == password)
+        if not ok:
+            return jsonify({'error': 'Invalid credentials'}), 401
+        claims = {'role': getattr(user, 'role', 'viewer'), 'email': user.email, 'name': getattr(user, 'name', '')}
+        access = create_access_token(identity=str(getattr(user, 'id', 0)), additional_claims=claims)
+        refresh = create_refresh_token(identity=str(getattr(user, 'id', 0)))
+        resp = jsonify({'ok': True})
+        set_access_cookies(resp, access_token=access)
+        set_refresh_cookies(resp, refresh_token=refresh)
+        return resp
+    except Exception as e:
+        return jsonify({'error': 'Login failed', 'detail': str(e)}), 500
+
+@app.route('/auth/refresh-cookie', methods=['POST', 'OPTIONS'])
+@jwt_required(refresh=True)
+def auth_refresh_cookie():
+    if request.method == 'OPTIONS':
+        return ("", 204)
+    try:
+        uid = get_jwt_identity()
+        user = User.query.get(int(uid)) if uid else None
+        c = {'role': getattr(user, 'role', 'viewer'), 'email': getattr(user, 'email', None), 'name': getattr(user, 'name', '')}
+        access = create_access_token(identity=str(uid), additional_claims=c)
+        resp = jsonify({'ok': True})
+        set_access_cookies(resp, access_token=access)
+        return resp
+    except Exception as e:
+        return jsonify({'error': 'Refresh failed', 'detail': str(e)}), 401
+
+@app.route('/auth/logout-cookie', methods=['POST', 'OPTIONS'])
+def auth_logout_cookie():
+    if request.method == 'OPTIONS':
+        return ("", 204)
+    resp = jsonify({'ok': True})
+    try:
+        unset_jwt_cookies(resp)
+    except Exception:
+        pass
+    return resp
+
+# --- Traccar integration (proxy snapshot) + Secondary GPS (gpsmontenegro) ---
+TRACCAR_BASE = (os.environ.get('TRACCAR_BASE_URL') or os.environ.get('TRACCAR_URL') or os.environ.get('TRACCAR_API') or '').strip()
+TRACCAR_TOKEN = (os.environ.get('TRACCAR_TOKEN') or os.environ.get('TRACCAR_API_TOKEN') or '').strip()
+TRACCAR_USER = (os.environ.get('TRACCAR_USER') or os.environ.get('TRACCAR_USERNAME') or '').strip()
+TRACCAR_PASS = (os.environ.get('TRACCAR_PASS') or os.environ.get('TRACCAR_PASSWORD') or '').strip()
+TRACCAR_INSECURE = (os.environ.get('TRACCAR_INSECURE', '').lower() in ('1','true','yes','on'))
+GPS_B_BASE = (os.environ.get('GPS_B_BASE_URL') or os.environ.get('GPSM_BASE_URL') or os.environ.get('GPSM_URL') or 'https://gpsmontenegro.me').strip()
+GPS_B_USER = (os.environ.get('GPS_B_USERNAME') or os.environ.get('GPSM_USERNAME') or os.environ.get('GPSM_USER') or '').strip()
+GPS_B_PASS = (os.environ.get('GPS_B_PASSWORD') or os.environ.get('GPSM_PASSWORD') or os.environ.get('GPSM_PASS') or '').strip()
+GPS_B_ENABLED = (os.environ.get('GPS_B_ENABLED', '').lower() in ('1','true','yes','on')) or bool(GPS_B_USER and GPS_B_PASS)
+GPS_B_INSECURE = (os.environ.get('GPS_B_INSECURE', os.environ.get('GPSM_INSECURE','')).lower() in ('1','true','yes','on'))
+GPS_B_LOGIN_PATH = (os.environ.get('GPS_B_LOGIN_PATH') or '/func/fn_connect.php').strip()
+GPS_B_DEVICES_PATH = (os.environ.get('GPS_B_DEVICES_PATH') or '/func/fn_objects.php').strip()
+GPS_B_HISTORY_PATH = (os.environ.get('GPS_B_HISTORY_PATH') or os.environ.get('GPS_B_POSITIONS_PATH') or '').strip()
+GPS_B_HISTORY_ROWS = int(os.environ.get('GPS_B_HISTORY_ROWS', '1') or '1')
+GPS_B_LATEST_WINDOW_MIN = int(os.environ.get('GPS_B_LATEST_WINDOW_MIN', '30') or '30')
+GPS_B_CACHE_TTL_SEC = int(os.environ.get('GPS_B_CACHE_TTL_SEC', os.environ.get('GPSM_CACHE_TTL_SEC','3')) or '3')
+GPS_B_POLL_INTERVAL_SEC = int(os.environ.get('GPS_B_POLL_INTERVAL_SEC', os.environ.get('GPSM_POLL_INTERVAL_SEC','10')) or '10')
+
+# Simple in-memory cache (per-process)
+_CACHE: dict[str, tuple[float, any]] = {}
+def _cache_get(key: str):
+    it = _CACHE.get(key)
+    if not it: return None
+    exp, val = it
+    if exp and exp < time.time():
+        _CACHE.pop(key, None)
+        return None
+    return val
+def _cache_set(key: str, val: any, ttl_sec: int = 3):
+    _CACHE[key] = (time.time() + max(0, ttl_sec), val)
+
+PODGORICA = ZoneInfo('Europe/Podgorica')
+def _to_podgorica_iso(ts: str | None) -> str | None:
+    if not ts:
+        return None
+    try:
+        # Try parsing common ISO formats
+        # Handle possible 'Z'
+        s = ts.replace('Z', '+00:00')
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(PODGORICA).isoformat()
+    except Exception:
+        try:
+            # Fallback: epoch seconds
+            sec = float(ts)
+            return datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(PODGORICA).isoformat()
+        except Exception:
+            return ts
+
+STALE_AFTER_SEC = int(os.environ.get('GPS_STALE_AFTER_SEC', '300') or '300')
+
+def _traccar_api_base() -> str:
+    if not TRACCAR_BASE:
+        return ''
+    base = TRACCAR_BASE.rstrip('/')
+    # Accept either full '/api' or root URL; normalize to include '/api'
+    return base if base.endswith('/api') else (base + '/api')
+
+def _traccar_headers() -> dict:
+    h = {'Accept': 'application/json'}
+    if TRACCAR_TOKEN:
+        h['Authorization'] = f'Bearer {TRACCAR_TOKEN}'
+    elif TRACCAR_USER and TRACCAR_PASS:
+        basic = base64.b64encode(f"{TRACCAR_USER}:{TRACCAR_PASS}".encode('utf-8')).decode('ascii')
+        h['Authorization'] = f'Basic {basic}'
+    return h
+
+def _http_get_json(url: str) -> any:
+    req = urllib.request.Request(url, headers=_traccar_headers())
+    ctx = None
+    if TRACCAR_INSECURE:
+        try:
+            ctx = ssl._create_unverified_context()
+        except Exception:
+            ctx = None
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+            ct = resp.headers.get('content-type') or ''
+            data = resp.read()
+            if not data:
+                return None
+            if 'application/json' in ct:
+                return json.loads(data.decode('utf-8'))
+            # Best-effort JSON parse even if content-type is missing
+            try:
+                return json.loads(data.decode('utf-8'))
+            except Exception:
+                return None
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode('utf-8')
+        except Exception:
+            detail = str(e)
+        raise RuntimeError(f"HTTP {e.code}: {detail}")
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+
+@app.route('/api/traccar/snapshot', methods=['GET'])
+@jwt_required()
+def traccar_snapshot():
+    base = _traccar_api_base()
+    if not base:
+        return jsonify({'error': 'traccar_not_configured', 'detail': 'Set TRACCAR_BASE_URL and TRACCAR_TOKEN (or TRACCAR_USER/TRACCAR_PASS) in backend env'}), 501
+    if not (TRACCAR_TOKEN or (TRACCAR_USER and TRACCAR_PASS)):
+        return jsonify({'error': 'traccar_auth_missing', 'detail': 'Provide TRACCAR_TOKEN or TRACCAR_USER/TRACCAR_PASS in backend env'}), 501
+    try:
+        devices = _http_get_json(base + '/devices') or []
+        positions = _http_get_json(base + '/positions') or []
+        # Index latest position per deviceId (positions endpoint already returns last known by default)
+        pos_by_dev = {}
+        try:
+            for p in positions:
+                did = p.get('deviceId') if isinstance(p, dict) else None
+                if did is not None:
+                    pos_by_dev[did] = p
+        except Exception:
+            pos_by_dev = {}
+
+        out = []
+        for d in (devices or []):
+            if not isinstance(d, dict):
+                continue
+            did = d.get('id')
+            p = pos_by_dev.get(did) if did is not None else None
+            # Convert Traccar speed (knots) -> m/s to match frontend (which multiplies by 3.6 to km/h)
+            spd = None
+            try:
+                if p is not None and p.get('speed') is not None:
+                    spd = float(p.get('speed')) * 0.514444
+            except Exception:
+                spd = None
+            # Prefer fixTime, then deviceTime, then serverTime
+            ts = (p or {}).get('fixTime') or (p or {}).get('deviceTime') or (p or {}).get('serverTime')
+            ts = _to_podgorica_iso(ts)
+            stale = False
+            try:
+                if ts:
+                    dt = datetime.fromisoformat(ts)
+                    stale = (datetime.now(PODGORICA) - dt) > timedelta(seconds=STALE_AFTER_SEC)
+            except Exception:
+                stale = False
+            out.append({
+                'id': d.get('id'),
+                'name': d.get('name') or d.get('uniqueId') or f"Device {d.get('id')}",
+                'status': d.get('status') or 'unknown',
+                'position': None if not p else {
+                    'latitude': p.get('latitude'),
+                    'longitude': p.get('longitude'),
+                    'address': p.get('address'),
+                    'speed': spd,
+                    'time': ts,
+                    'stale': stale,
+                }
+            })
+        return jsonify({'devices': out})
+    except RuntimeError as e:
+        return jsonify({'error': 'traccar_upstream_error', 'detail': str(e)}), 502
+    except Exception as e:
+        return jsonify({'error': 'traccar_internal_error', 'detail': str(e)}), 500
+
+# ----------------------- Aggregated A+B endpoints -----------------------
+
+def _normalize_a_devices() -> list[dict]:
+    # Cache A for a brief period to avoid burst
+    cached = _cache_get('A_devices')
+    if cached is not None:
+        return cached
+    base = _traccar_api_base()
+    devices = _http_get_json(base + '/devices') or []
+    positions = _http_get_json(base + '/positions') or []
+    pos_by = { p.get('deviceId'): p for p in positions if isinstance(p, dict) }
+    out: list[dict] = []
+    for d in devices or []:
+        if not isinstance(d, dict):
+            continue
+        p = pos_by.get(d.get('id'))
+        spd = None
+        try:
+            if p is not None and p.get('speed') is not None:
+                spd = float(p.get('speed')) * 0.514444
+        except Exception:
+            spd = None
+        ts = (p or {}).get('fixTime') or (p or {}).get('deviceTime') or (p or {}).get('serverTime')
+        iso = _to_podgorica_iso(ts)
+        stale = False
+        try:
+            if iso:
+                dt = datetime.fromisoformat(iso)
+                stale = (datetime.now(PODGORICA) - dt) > timedelta(seconds=STALE_AFTER_SEC)
+        except Exception:
+            pass
+        out.append({
+            'id': f"A:{d.get('id')}",
+            'name': d.get('name') or d.get('uniqueId') or f"Device {d.get('id')}",
+            'status': d.get('status') or 'unknown',
+            'source': 'A',
+            'position': None if not p else {
+                'latitude': p.get('latitude'),
+                'longitude': p.get('longitude'),
+                'address': p.get('address'),
+                'speed': spd,
+                'time': iso,
+                'stale': stale,
+            }
+        })
+    _cache_set('A_devices', out, ttl_sec=3)
+    return out
+
+# For gpsmontenegro we assume Traccar-compatible API; endpoints can be adjusted later if needed.
+def _gpsm_api_base() -> str:
+    base = (GPSM_BASE or '').rstrip('/')
+    return base if base.endswith('/api') else (base + '/api')
+
+def _normalize_b_devices() -> list[dict]:
+    # Devices via PHP session client + enrich with latest position from history
+    base_list = _gpsb_devices()
+    out: list[dict] = []
+    for d in base_list:
+        try:
+            # id is 'B:<IMEI>'
+            imei = str(d.get('id') or '')
+            imei = imei.split(':',1)[1] if ':' in imei else imei
+            pos = _gpsb_latest_position(imei)
+        except Exception:
+            pos = None
+        out.append({
+            **d,
+            'position': pos,
+        })
+    return out
+
+def _merged_devices() -> list[dict]:
+    out = []
+    out.extend(_normalize_a_devices())
+    out.extend(_normalize_b_devices())
+    return out
+
+# ----------------------- Source B (PHP session) ------------------------
+_gpsb_cookiejar = http.cookiejar.CookieJar()
+_gpsb_opener = None
+_gpsb_lock = threading.Lock()
+_last_b_success = None
+_last_b_error = None
+
+def _gpsb_build_opener():
+    global _gpsb_opener
+    handlers = [urllib.request.HTTPCookieProcessor(_gpsb_cookiejar)]
+    if GPS_B_INSECURE:
+        try:
+            ctx = ssl._create_unverified_context()
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        except Exception:
+            pass
+    _gpsb_opener = urllib.request.build_opener(*handlers)
+
+def _gpsb_base() -> str:
+    return (GPS_B_BASE or '').rstrip('/')
+
+def _gpsb_login() -> None:
+    if not GPS_B_USER or not GPS_B_PASS:
+        raise RuntimeError('gps_b_auth_missing')
+    if _gpsb_opener is None:
+        _gpsb_build_opener()
+    url = _gpsb_base() + GPS_B_LOGIN_PATH
+    # Try common payloads; do not log secrets
+    candidates = [
+        {'cmd':'login', 'username': GPS_B_USER, 'password': GPS_B_PASS},
+        {'cmd':'login', 'email': GPS_B_USER, 'password': GPS_B_PASS},
+        {'username': GPS_B_USER, 'password': GPS_B_PASS},
+    ]
+    last_err = None
+    for body in candidates:
+        data = urllib.parse.urlencode(body).encode('utf-8')
+        req = urllib.request.Request(url, method='POST', data=data, headers={
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json, text/plain, */*',
+        })
+        try:
+            with _gpsb_opener.open(req, timeout=15) as resp:
+                _ = resp.read()
+                # Heuristic: presence of PHPSESSID cookie
+                for c in _gpsb_cookiejar:
+                    if c.name.upper() == 'PHPSESSID' and c.domain in url:
+                        return
+                return  # assume ok; server may set cookie without name match at this point
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f'gps_b_login_failed: {last_err}')
+
+def _gpsb_post(path: str, form: dict) -> bytes:
+    if _gpsb_opener is None:
+        _gpsb_build_opener()
+    url = _gpsb_base() + (path if path.startswith('/') else '/' + path)
+    data = urllib.parse.urlencode(form).encode('utf-8')
+    req = urllib.request.Request(url, method='POST', data=data, headers={
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json, text/plain, */*',
+    })
+    try:
+        with _gpsb_opener.open(req, timeout=20) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            with _gpsb_lock:
+                _gpsb_login()
+            with _gpsb_opener.open(req, timeout=20) as resp:
+                return resp.read()
+        raise
+
+def _gpsb_get(path: str, params: dict[str, str]) -> bytes:
+    if _gpsb_opener is None:
+        _gpsb_build_opener()
+    base = _gpsb_base()
+    qs = urllib.parse.urlencode(params)
+    url = base + (path if path.startswith('/') else '/' + path)
+    if qs:
+        url = f"{url}?{qs}"
+    req = urllib.request.Request(url, method='GET', headers={
+        'Accept': 'application/json, text/plain, */*',
+    })
+    try:
+        with _gpsb_opener.open(req, timeout=20) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            with _gpsb_lock:
+                _gpsb_login()
+            with _gpsb_opener.open(req, timeout=20) as resp:
+                return resp.read()
+        raise
+
+def _gpsb_devices() -> list[dict]:
+    if not GPS_B_ENABLED:
+        return []
+
+def _gpsb_latest_position(imei: str) -> dict | None:
+    if not GPS_B_ENABLED or not GPS_B_HISTORY_PATH:
+        return None
+    cache_key = f"B_pos:{imei}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        now = datetime.now(PODGORICA)
+        dtf = (now - timedelta(minutes=max(1, GPS_B_LATEST_WINDOW_MIN))).strftime('%Y-%m-%d %H:%M:%S')
+        dtt = now.strftime('%Y-%m-%d %H:%M:%S')
+        params = {
+            'cmd': 'load_msg_list',
+            'imei': imei,
+            'dtf': dtf,
+            'dtt': dtt,
+            'rows': str(max(1, GPS_B_HISTORY_ROWS)),
+            'page': '1',
+            'sidx': 'dt_tracker',
+            'sord': 'desc',
+        }
+        raw = _gpsb_get(GPS_B_HISTORY_PATH, params)
+        txt = raw.decode('utf-8', 'ignore')
+        try:
+            data = json.loads(txt)
+        except Exception:
+            data = {}
+        # Extract first record
+        rows = []
+        if isinstance(data, dict):
+            # jqGrid-like payloads often use 'rows' or 'data'
+            if isinstance(data.get('rows'), list):
+                rows = data['rows']
+            elif isinstance(data.get('data'), list):
+                rows = data['data']
+            else:
+                # sometimes nested: { page, total, records, rows: [{cell:{...}}] }
+                rows = []
+        elif isinstance(data, list):
+            rows = data
+        rec = None
+        for r in rows:
+            if isinstance(r, dict) and r:
+                # Some schemas use r['cell']
+                cell = r.get('cell') if isinstance(r.get('cell'), dict) else r
+                rec = cell
+                break
+        if not rec:
+            _cache_set(cache_key, None, ttl_sec=GPS_B_CACHE_TTL_SEC)
+            return None
+        # Map coordinates
+        lat = rec.get('lat') or rec.get('latitude')
+        lon = rec.get('lng') or rec.get('lon') or rec.get('longitude')
+        try:
+            lat = float(lat)
+            lon = float(lon)
+        except Exception:
+            return None
+        # Map speed; assume km/h and convert to m/s
+        sp = rec.get('speed') or rec.get('kmh')
+        try:
+            sp = float(sp) / 3.6 if sp is not None else None
+        except Exception:
+            sp = None
+        # Map time
+        ts = rec.get('dt_tracker') or rec.get('datetime') or rec.get('time')
+        iso = _to_podgorica_iso(ts if isinstance(ts, str) else str(ts) if ts is not None else None)
+        stale = False
+        try:
+            if iso:
+                dt = datetime.fromisoformat(iso)
+                stale = (datetime.now(PODGORICA) - dt) > timedelta(seconds=STALE_AFTER_SEC)
+        except Exception:
+            pass
+        pos = {
+            'latitude': lat,
+            'longitude': lon,
+            'address': None,
+            'speed': sp,
+            'time': iso,
+            'stale': stale,
+        }
+        _cache_set(cache_key, pos, ttl_sec=GPS_B_CACHE_TTL_SEC)
+        return pos
+    except Exception as e:
+        try:
+            print('[GPS_B] history failed:', str(e)[:200])
+        except Exception:
+            pass
+        _cache_set(cache_key, None, ttl_sec=GPS_B_CACHE_TTL_SEC)
+        return None
+    cached = _cache_get('B_devices')
+    if cached is not None:
+        return cached
+    try:
+        with _gpsb_lock:
+            if not any(c.name.upper()=='PHPSESSID' for c in _gpsb_cookiejar):
+                # session_check if path is known, otherwise login
+                try:
+                    _gpsb_login()
+                except Exception:
+                    pass
+        raw = _gpsb_post(GPS_B_DEVICES_PATH, {'cmd':'load_object_data'})
+        txt = raw.decode('utf-8','ignore')
+        try:
+            data = json.loads(txt)
+        except Exception:
+            # Some endpoints may return JSON encoded in a field; best effort
+            data = []
+        out: list[dict] = []
+        if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list):
+            rows = data['data']
+        else:
+            rows = data if isinstance(data, list) else []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            imei = str(r.get('imei') or r.get('IMEI') or r.get('unique') or r.get('uniqueId') or r.get('id') or '').strip()
+            if not imei:
+                continue
+            name = (r.get('name') or r.get('label') or r.get('plate') or imei)
+            out.append({
+                'id': f'B:{imei}',
+                'name': name,
+                'status': r.get('status') or 'unknown',
+                'source': 'B',
+                'position': None,  # positions added when endpoint is confirmed
+            })
+        _cache_set('B_devices', out, ttl_sec=GPS_B_CACHE_TTL_SEC)
+        _last_b_success = time.time()
+        _last_b_error = None
+        return out
+    except Exception as e:
+        _last_b_error = f'{type(e).__name__}: {e}'
+        try:
+            print('[GPS_B] devices failed:', str(e)[:200])
+        except Exception:
+            pass
+        return []
+
+@app.route('/api/vehicles', methods=['GET'])
+@jwt_required()
+def vehicles_all():
+    try:
+        return jsonify(_merged_devices())
+    except Exception as e:
+        return jsonify({'error':'vehicles_internal','detail':str(e)}), 500
+
+@app.route('/api/positions', methods=['GET'])
+@jwt_required()
+def positions_all():
+    # Flatten positions; supports optional filter by source or explicit deviceIds
+    try:
+        device_ids = request.args.get('deviceIds') or request.args.get('device_ids') or ''
+        src = (request.args.get('source') or '').upper()
+        out = []
+        if device_ids:
+            ids = [s.strip() for s in device_ids.split(',') if s.strip()]
+            a_ids = []
+            b_imeis = []
+            for did in ids:
+                up = did.upper()
+                if up.startswith('A:'):
+                    a_ids.append(up.split(':',1)[1])
+                elif up.startswith('B:'):
+                    b_imeis.append(up.split(':',1)[1])
+            # A: reuse normalized A devices and filter
+            if a_ids:
+                for d in _normalize_a_devices():
+                    orig = str(d.get('id') or '')
+                    if orig.startswith('A:') and orig.split(':',1)[1] in a_ids:
+                        p = d.get('position') or {}
+                        if p:
+                            out.append({
+                                'deviceId': d.get('id'),
+                                'name': d.get('name'),
+                                'source': d.get('source'),
+                                'latitude': p.get('latitude'),
+                                'longitude': p.get('longitude'),
+                                'address': p.get('address'),
+                                'speed': p.get('speed'),
+                                'time': p.get('time'),
+                                'stale': bool(p.get('stale')),
+                            })
+            # B: call latest history per IMEI
+            for imei in b_imeis:
+                pos = _gpsb_latest_position(imei)
+                if pos:
+                    out.append({
+                        'deviceId': f'B:{imei}',
+                        'name': None,
+                        'source': 'B',
+                        'latitude': pos.get('latitude'),
+                        'longitude': pos.get('longitude'),
+                        'address': pos.get('address'),
+                        'speed': pos.get('speed'),
+                        'time': pos.get('time'),
+                        'stale': bool(pos.get('stale')),
+                    })
+            return jsonify(out)
+        # Fallback: return all positions for current merged devices
+        devs = _merged_devices()
+        if src in ('A','B'):
+            devs = [d for d in devs if (d.get('source') or '').upper()==src]
+        for d in devs:
+            p = d.get('position') or {}
+            if not p:
+                continue
+            out.append({
+                'deviceId': d.get('id'),
+                'name': d.get('name'),
+                'source': d.get('source'),
+                'latitude': p.get('latitude'),
+                'longitude': p.get('longitude'),
+                'address': p.get('address'),
+                'speed': p.get('speed'),
+                'time': p.get('time'),
+                'stale': bool(p.get('stale')),
+            })
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({'error':'positions_internal','detail':str(e)}), 500
+
 # --- Models (imported from models.py) ---
 from models import (
     User as User,
@@ -381,6 +1089,15 @@ if os.environ.get('AUTO_CREATE_TABLES', '1').lower() in ('1','true','yes','on'):
                         print('[BOOTSTRAP] Added users.password_hash')
                 except Exception as e:
                     print('[BOOTSTRAP] Inspect/add users.password_hash skipped:', e)
+                # Ensure arrivals.category exists for category support
+                try:
+                    a_cols = [c['name'] for c in insp.get_columns('arrivals')]
+                    if 'category' not in a_cols:
+                        db.session.execute(text("ALTER TABLE arrivals ADD COLUMN category VARCHAR(255)"))
+                        db.session.commit()
+                        print('[BOOTSTRAP] Added arrivals.category')
+                except Exception as e:
+                    print('[BOOTSTRAP] Inspect/add arrivals.category skipped:', e)
                 # Migrate legacy plaintext passwords
                 try:
                     from werkzeug.security import generate_password_hash
@@ -406,11 +1123,15 @@ if os.environ.get('AUTO_CREATE_TABLES', '1').lower() in ('1','true','yes','on'):
 ROLE_FIELDS = {
     'admin': {'supplier','carrier','plate','type','eta','status','note','order_date','production_due',
               'shipped_at','arrived_at','customs_info','freight_cost','customs_cost','currency','assignee_id',
-              'driver','pickup_date','goods_cost','responsible','location'},
-    'planer': {'supplier','order_date','production_due','status','note','location'},
+              'driver','pickup_date','goods_cost','responsible','location','category'},
+    'manager': {'supplier','carrier','plate','type','eta','status','note','order_date','production_due',
+                'shipped_at','arrived_at','customs_info','freight_cost','customs_cost','currency','assignee_id',
+                'driver','pickup_date','goods_cost','responsible','location','category'},
+    'planer': {'supplier','order_date','production_due','status','note','location','category'},
     'proizvodnja': {'status','note'},
     'transport': {'carrier','plate','eta','status','shipped_at','note','driver','pickup_date','freight_cost','location'},
     'carina': {'status','customs_info','customs_cost','note'},
+    'worker': {'status','note'},
     'viewer': set(),
 }
 
@@ -577,6 +1298,7 @@ def arrivals_list_fallback():
                 type=data.get('type') or data.get('transport_type') or 'truck',
                 pickup_date=_parse_iso(data.get('pickup_date')),
                 eta=_parse_iso(data.get('eta')),
+                category=data.get('category'),
                 status=(data.get('status') or 'not_shipped'),
                 note=data.get('note'),
                 order_date=_parse_iso(data.get('order_date')),
@@ -594,6 +1316,11 @@ def arrivals_list_fallback():
             )
             db.session.add(a)
             db.session.commit()
+            try:
+                title = (a.supplier or '').strip() or (a.type or 'Dolazak')
+                notify(f"Novi dolazak (#{a.id}{' – ' + title if title else ''})", ntype='info', entity_type='arrival', entity_id=a.id)
+            except Exception:
+                pass
             try:
                 ws_broadcast({
                     'type': 'arrivals.created',
@@ -656,7 +1383,7 @@ def arrivals_update_fallback(aid):
     try:
         # Simple field map
         str_fields = [
-            'supplier','carrier','plate','driver','type','status','note','currency','responsible','location'
+            'supplier','carrier','plate','driver','type','status','note','currency','responsible','location','category'
         ]
         for k in str_fields:
             if k in data:
@@ -681,6 +1408,11 @@ def arrivals_update_fallback(aid):
             obj.customs_cost = _parse_float(data.get('customs_cost'))
 
         db.session.commit()
+        try:
+            if 'status' in data:
+                notify(f"Promjena statusa dolaska (#{obj.id}) → {data.get('status')}", ntype='info', entity_type='arrival', entity_id=obj.id)
+        except Exception:
+            pass
         try:
             ws_broadcast({
                 'type': 'arrivals.updated',
@@ -724,6 +1456,10 @@ def arrivals_status_fallback(aid):
     try:
         obj.status = status
         db.session.commit()
+        try:
+            notify(f"Promjena statusa dolaska (#{obj.id}) → {status}", ntype='info', entity_type='arrival', entity_id=obj.id)
+        except Exception:
+            pass
         try:
             ws_broadcast({
                 'type': 'arrivals.updated', 'resource': 'arrivals', 'action':'updated',
@@ -769,7 +1505,7 @@ def arrivals_files_fallback(arrival_id):
             } for f in files
         ])
 
-    # POST – upload one or more files
+    # POST – upload one or more files (supports S3 if configured)
     try:
         files = []
         if 'files' in request.files:
@@ -779,24 +1515,68 @@ def arrivals_files_fallback(arrival_id):
         if not files:
             return jsonify({"error": "file or files required"}), 400
 
+        # Optional S3 config
+        s3_bucket = os.environ.get('S3_BUCKET')
+        s3_public = os.environ.get('S3_PUBLIC_URL')
+        s3_client = None
+        if s3_bucket:
+            try:
+                import boto3  # type: ignore
+                s3_client = boto3.client(
+                    's3',
+                    endpoint_url=os.environ.get('S3_ENDPOINT') or None,
+                    region_name=os.environ.get('S3_REGION') or None,
+                    aws_access_key_id=os.environ.get('S3_ACCESS_KEY') or None,
+                    aws_secret_access_key=os.environ.get('S3_SECRET_KEY') or None,
+                    use_ssl=(os.environ.get('S3_USE_SSL','1').lower() in ('1','true','yes','on')),
+                )
+            except Exception:
+                s3_client = None
+
         out = []
         for f in files:
             if not f or f.filename == '':
                 continue
             safe_name = secure_filename(f.filename)
             uniq = f"{int(time.time()*1000)}_{safe_name}"
-            path = os.path.join(app.config['UPLOAD_FOLDER'], uniq)
-            f.save(path)
-            rec = ArrivalFile(arrival_id=arrival_id, filename=uniq, original_name=safe_name)
+            # Basic file type guard by extension (configurable via ALLOWED_UPLOAD_EXT)
+            try:
+                allowed_ext = set((os.environ.get('ALLOWED_UPLOAD_EXT') or 'pdf,jpg,jpeg,png,doc,docx,xls,xlsx,csv,txt').lower().split(','))
+                ext = (safe_name.rsplit('.', 1)[-1] or '').lower()
+                if ext and allowed_ext and ext not in allowed_ext:
+                    return jsonify({"error": "invalid_file_type", "detail": safe_name}), 400
+            except Exception:
+                pass
+            stored = uniq
+            if s3_client and s3_bucket:
+                key = f"arrivals/{arrival_id}/{uniq}"
+                try:
+                    s3_client.upload_fileobj(getattr(f, 'stream', f), s3_bucket, key, ExtraArgs={"ContentType": getattr(f, 'mimetype', None) or 'application/octet-stream'})
+                    stored = f"s3:{key}"
+                except Exception as _e:
+                    return jsonify({"error": "upload_failed", "detail": str(_e)}), 500
+            else:
+                path = os.path.join(app.config['UPLOAD_FOLDER'], uniq)
+                f.save(path)
+            rec = ArrivalFile(arrival_id=arrival_id, filename=stored, original_name=safe_name)
             db.session.add(rec)
             db.session.flush()
+            # Construct url
+            if stored.startswith('s3:') and s3_bucket:
+                key = stored[3:]
+                if s3_public:
+                    url = f"{s3_public.rstrip('/')}/{key}"
+                else:
+                    url = f"/api/arrivals/{arrival_id}/files/{rec.id}/download"
+            else:
+                url = f"/api/arrivals/{arrival_id}/files/{rec.id}/download"
             out.append({
                 "id": rec.id,
                 "arrival_id": rec.arrival_id,
                 "filename": rec.filename,
                 "original_name": rec.original_name,
                 "uploaded_at": (rec.uploaded_at or datetime.utcnow()).isoformat(),
-                "url": f"/api/arrivals/{arrival_id}/files/{rec.id}/download",
+                "url": url,
             })
         db.session.commit()
         return jsonify(out), 201
@@ -838,7 +1618,32 @@ def arrival_file_download(arrival_id, file_id):
         rec = ArrivalFile.query.filter_by(id=file_id, arrival_id=arrival_id).first()
         if not rec:
             return jsonify({'error':'Not found'}), 404
-        return send_from_directory(app.config['UPLOAD_FOLDER'], rec.filename, as_attachment=False)
+        fname = rec.filename or ''
+        if fname.startswith('s3:'):
+            key = fname[3:]
+            s3_bucket = os.environ.get('S3_BUCKET')
+            s3_public = os.environ.get('S3_PUBLIC_URL')
+            if s3_public:
+                return redirect(f"{s3_public.rstrip('/')}/{key}", code=302)
+            try:
+                import boto3  # type: ignore
+                s3 = boto3.client(
+                    's3',
+                    endpoint_url=os.environ.get('S3_ENDPOINT') or None,
+                    region_name=os.environ.get('S3_REGION') or None,
+                    aws_access_key_id=os.environ.get('S3_ACCESS_KEY') or None,
+                    aws_secret_access_key=os.environ.get('S3_SECRET_KEY') or None,
+                    use_ssl=(os.environ.get('S3_USE_SSL','1').lower() in ('1','true','yes','on')),
+                )
+                url = s3.generate_presigned_url(
+                    ClientMethod='get_object',
+                    Params={'Bucket': s3_bucket, 'Key': key},
+                    ExpiresIn=int(os.environ.get('S3_PRESIGN_TTL', '600')),
+                )
+                return redirect(url, code=302)
+            except Exception as _e:
+                return jsonify({'error':'presign_failed','detail':str(_e)}), 500
+        return send_from_directory(app.config['UPLOAD_FOLDER'], fname, as_attachment=False, download_name=getattr(rec,'original_name',fname))
     except Exception as e:
         return jsonify({'error':'download_failed','detail':str(e)}), 500
 
@@ -872,6 +1677,7 @@ def arrivals_create_explicit():
             type=data.get('type') or data.get('transport_type') or 'truck',
             pickup_date=_parse_iso(data.get('pickup_date')),
             eta=_parse_iso(data.get('eta')),
+            category=data.get('category'),
             status=(data.get('status') or 'not_shipped'),
             note=data.get('note'),
             order_date=_parse_iso(data.get('order_date')),
@@ -2145,6 +2951,45 @@ def sla_monitor_loop():
                             continue
                 except Exception as _late2_err:
                     print('[SLA LOOP] late-containers scan error:', _late2_err)
+                # Late pickups: pickup_date < today and not shipped/arrived
+                try:
+                    today = datetime.utcnow().date()
+                    recent_arrivals2 = db.session.query(Arrival).order_by(Arrival.created_at.desc()).limit(200).all()
+                    for a in recent_arrivals2:
+                        try:
+                            status = (getattr(a, 'status', '') or '').lower()
+                            if status in ('shipped','u transportu','transport','arrived','stiglo'):
+                                continue
+                            pd = getattr(a, 'pickup_date', None)
+                            if not pd:
+                                continue
+                            try:
+                                pd_date = pd if isinstance(pd, datetime) else datetime.fromisoformat(str(pd))
+                                pd_date = pd_date.date()
+                            except Exception:
+                                try:
+                                    from datetime import date as _date
+                                    pd_date = _date.fromisoformat(str(pd))
+                                except Exception:
+                                    pd_date = None
+                            if not pd_date:
+                                continue
+                            if pd_date < today:
+                                existing = (
+                                    db.session.query(Notification)
+                                    .filter(
+                                        Notification.entity_type=='arrival',
+                                        Notification.entity_id==a.id,
+                                        Notification.type=='warning',
+                                        Notification.text.ilike('%pickup%')
+                                    ).first()
+                                )
+                                if not existing:
+                                    notify(f"Pickup kasni (#{a.id})", ntype='warning', entity_type='arrival', entity_id=a.id)
+                        except Exception:
+                            continue
+                except Exception as _late3_err:
+                    print('[SLA LOOP] late-pickups scan error:', _late3_err)
         except Exception as e:
             print("[SLA LOOP ERROR]", e)
         time.sleep(SLA_CHECK_SECONDS)
@@ -2332,6 +3177,26 @@ def _debug_arrivals_methods():
         return jsonify({'arrivals_endpoints': found, 'ws_enabled': ws_ok}), 200
     except Exception as e:
         return jsonify({'error': 'introspect_failed', 'detail': str(e)}), 500
+
+@app.post('/api/_debug/notify-test')
+def _notify_test():
+    try:
+        verify_jwt_in_request(optional=True)
+    except Exception:
+        return jsonify({'error':'Unauthorized'}), 401
+    claims = get_jwt() if get_jwt else {}
+    role = (claims or {}).get('role')
+    if role not in ('admin','system'):
+        return jsonify({'error':'Forbidden'}), 403
+    data = request.get_json(silent=True) or {}
+    text = (data.get('text') or 'Test notification').strip()
+    et = data.get('entity_type') or None
+    eid = data.get('entity_id')
+    try:
+        notify(text, ntype=str(data.get('type') or 'info'), entity_type=et, entity_id=int(eid) if eid else None)
+        return jsonify({'ok': True, 'text': text}), 201
+    except Exception as e:
+        return jsonify({'error':'notify_failed','detail':str(e)}), 500
 
 # --- Health ---
 @app.route('/health', methods=['GET', 'HEAD', 'OPTIONS'], strict_slashes=False)
