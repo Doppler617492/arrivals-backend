@@ -247,50 +247,43 @@ def update_arrival_status(id):
 
 @bp.route("/<int:id>", methods=["DELETE", "OPTIONS"], strict_slashes=False)
 def delete_arrival(id):
-    # Handle CORS preflight
+    # CORS preflight
     if request.method == 'OPTIONS':
         return ("", 204)
-    # Require JWT for all users; no admin role check
+
+    # JWT obavezan (bez role checka)
+    from flask_jwt_extended import verify_jwt_in_request
     try:
         verify_jwt_in_request(optional=False)
     except Exception:
+        from flask import jsonify
         return jsonify({'error': 'Unauthorized'}), 401
+
+    from models import Arrival
     a = Arrival.query.get(id)
     if not a:
+        from flask import jsonify
         return jsonify({'error': 'Not found'}), 404
-    # Hard delete + best-effort remove files
-    try:
-        for f in list(getattr(a, 'files', []) or []):
-            try:
-                os.remove(os.path.join(current_app.config['UPLOAD_FOLDER'], f.filename))
-            except Exception:
-                pass
-    except Exception:
-        pass
+
+    # Hard delete
+    from app import db, ws_broadcast
     db.session.delete(a)
     db.session.commit()
-    # Optional audit log
-    try:
-        uid = get_jwt_identity()
-        msg = f"arrival:{id} deleted_by:{uid}"
-        try:
-            current_app.logger.info('[AUDIT] ' + msg)
-        except Exception:
-            pass
-    except Exception:
-        pass
-    # Broadcast realtime event so UI can remove card without refetch
+
+    # Realtime event (mora imati id)
+    from datetime import datetime
     try:
         ws_broadcast({
             'type': 'arrivals.deleted',
             'resource': 'arrivals',
-            'action': 'deleted',
             'id': int(id),
             'v': 1,
             'ts': datetime.utcnow().isoformat() + 'Z',
         })
     except Exception:
         pass
+
+    from flask import jsonify
     return jsonify({'ok': True, 'id': int(id)}), 200
 
 @bp.delete("/bulk_delete")

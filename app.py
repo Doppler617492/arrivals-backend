@@ -1527,8 +1527,12 @@ def arrivals_update_fallback(aid):
         db.session.rollback()
         return jsonify({"error": "update_failed", "detail": str(e)}), 500
 
-# Fallback: delete a single arrival (DISABLED to avoid shadowing blueprint)
+# --- BEGIN DISABLED DELETE FALLBACK ---
 # @app.route('/api/arrivals/<int:aid>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
+def arrivals_delete_fallback_disabled(aid):
+    from flask import jsonify
+    return jsonify({'error': 'disabled'}), 404
+# --- END DISABLED DELETE FALLBACK ---
 def arrivals_delete_fallback(aid):
     return jsonify({'error': 'disabled'}), 404
     # Below kept for parity reference; not active.
