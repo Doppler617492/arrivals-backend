@@ -82,7 +82,7 @@ class Notification(db.Model):
     created_at  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
     def to_dict(self):
-        return {
+        data = {
             'id': self.id,
             'user_id': self.user_id,
             'role': self.role,
@@ -95,6 +95,14 @@ class Notification(db.Model):
             'dedup_key': self.dedup_key,
             'created_at': (self.created_at or datetime.utcnow()).isoformat(),
         }
+        try:
+            if self.entity_type == 'arrival' and self.entity_id:
+                data['navigate_url'] = f"/arrivals#{int(self.entity_id)}"
+            elif self.entity_type == 'container' and self.entity_id:
+                data['navigate_url'] = f"/containers#{int(self.entity_id)}"
+        except Exception:
+            pass
+        return data
 
 # --- Arrivals ---
 class Arrival(db.Model):

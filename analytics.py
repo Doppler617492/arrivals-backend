@@ -61,6 +61,108 @@ def _arrival_date_col():
         # Fallback: use arrived_at only
         return Arrival.arrived_at
 
+
+def _arrival_cost(row: Arrival) -> float:
+    try:
+        return float((row.goods_cost or 0) + (row.freight_cost or 0) + (row.customs_cost or 0))
+    except Exception:
+        return 0.0
+
+
+def _coerce_eta(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return _parse_iso_date(value)
+    try:
+        # Some deployments store ETA as date objects
+        if hasattr(value, 'isoformat'):
+            return datetime.fromisoformat(value.isoformat())
+    except Exception:
+        pass
+    return None
+
+
+def _arrival_delay_days(row: Arrival) -> float | None:
+    try:
+        eta_dt = _coerce_eta(getattr(row, 'eta', None))
+        arrived_at = getattr(row, 'arrived_at', None)
+        if not eta_dt or not arrived_at:
+            return None
+        return (arrived_at - eta_dt).total_seconds() / 86400.0
+    except Exception:
+        return None
+
+
+def _fetch_arrivals_scope():
+    dfrom, dto = _date_range_args()
+    date_col = _arrival_date_col()
+    q = db.session.query(Arrival).filter(date_col.between(dfrom, dto))
+    q = _apply_common_filters(q)
+    rows = q.all()
+    return rows, dfrom, dto
+
+
+def _aggregate_arrivals(rows: list[Arrival], attr: str, fallback_label: str):
+    fallback = fallback_label or 'Neodređeno'
+    bucket = {}
+    for row in rows:
+        raw = getattr(row, attr, None) if hasattr(row, attr) else None
+        label = raw.strip() if isinstance(raw, str) else raw
+        if not label:
+            label = fallback
+        label = str(label)
+        data = bucket.setdefault(label, {
+            'label': label,
+            'count': 0,
+            'total_value': 0.0,
+            'late_samples': [],
+            'scheduled_samples': 0,
+            'on_time_or_early': 0,
+        })
+        data['count'] += 1
+        data['total_value'] += _arrival_cost(row)
+        delay_days = _arrival_delay_days(row)
+        if delay_days is not None:
+            data['scheduled_samples'] += 1
+            if delay_days <= 0:
+                data['on_time_or_early'] += 1
+            else:
+                data['late_samples'].append(delay_days)
+
+    items = []
+    for entry in bucket.values():
+        late_samples = entry['late_samples']
+        scheduled = entry['scheduled_samples'] or 0
+        on_time = entry['on_time_or_early'] or 0
+        avg_delay = (sum(late_samples) / len(late_samples)) if late_samples else 0.0
+        on_time_rate = (on_time / scheduled) if scheduled else 0.0
+        items.append({
+            'label': entry['label'],
+            'count': int(entry['count']),
+            'total_value': float(entry['total_value']),
+            'avg_delay_days': float(avg_delay),
+            'on_time_rate': float(on_time_rate),
+            'scheduled_samples': int(scheduled),
+        })
+
+    items.sort(key=lambda x: (x['total_value'], x['count']), reverse=True)
+    return items
+
+
+def _arrivals_breakdown_response(attr: str, fallback_label: str, error_key: str):
+    try:
+        rows, dfrom, dto = _fetch_arrivals_scope()
+        items = _aggregate_arrivals(rows, attr, fallback_label)
+        return jsonify({
+            'items': items,
+            'window': {'from': dfrom.isoformat(), 'to': dto.isoformat()},
+        })
+    except Exception as exc:
+        return jsonify({'error': error_key, 'detail': str(exc)}), 500
+
 # --- Containers helpers ---
 def _money_to_number(val):
     if val is None:
@@ -290,6 +392,31 @@ def arrivals_top_suppliers():
         return jsonify({'items': data, 'limit': limit})
     except Exception as e:
         return jsonify({'error':'analytics_top_suppliers_failed','detail':str(e)}), 500
+
+
+@bp.get("/arrivals/by-category")
+def arrivals_by_category():
+    return _arrivals_breakdown_response('category', 'Bez kategorije', 'analytics_arrivals_by_category_failed')
+
+
+@bp.get("/arrivals/by-responsible")
+def arrivals_by_responsible():
+    return _arrivals_breakdown_response('responsible', 'Bez odgovorne osobe', 'analytics_arrivals_by_responsible_failed')
+
+
+@bp.get("/arrivals/by-location")
+def arrivals_by_location():
+    return _arrivals_breakdown_response('location', 'Bez lokacije', 'analytics_arrivals_by_location_failed')
+
+
+@bp.get("/arrivals/by-carrier")
+def arrivals_by_carrier():
+    return _arrivals_breakdown_response('carrier', 'Bez prevoznika', 'analytics_arrivals_by_carrier_failed')
+
+
+@bp.get("/arrivals/by-agent")
+def arrivals_by_agent():
+    return _arrivals_breakdown_response('agent', 'Bez agenta', 'analytics_arrivals_by_agent_failed')
 
 
 @bp.get("/costs/series")

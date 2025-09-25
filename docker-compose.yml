@@ -21,7 +21,7 @@ services:
       - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://arrivals:supersecretchangeit@db:5432/arrivals}
       - UPLOAD_DIR=/app/uploads
       - API_KEY=devkey123
-      - ALLOWED_ORIGINS=http://localhost:5173
+      - ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
       - LOG_HTTP=1
     volumes:
       - ./uploads:/app/uploads

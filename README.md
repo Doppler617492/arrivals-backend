@@ -15,7 +15,7 @@ These folders survive `docker compose down -v` because they are bind‑mounts, n
 Key env in `backend`:
 - `DATABASE_URL` — Postgres connection, e.g. `postgresql+psycopg://arrivals:supersecretchangeit@db:5432/arrivals`
 - `UPLOAD_DIR=/app/uploads`
-- `ALLOWED_ORIGINS=http://localhost:5173` (Vite dev origin)
+- `ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173` (Vite dev origin)
 - `LOG_HTTP=1` (optional request timing logs)
 
 ## Start / Stop / Restart
@@ -64,7 +64,6 @@ psql -h 127.0.0.1 -p 5432 -U arrivals -d arrivals < arrivals_backup.sql
 - All routes: `GET http://localhost:8081/_debug/routes`
 
 ## Common FAQs
-- 405 on PATCH/POST/DELETE: make sure you’re hitting the WS‑capable backend on 8081 started by this compose. Check `docker compose ps` for the port mapping and restart with `--build`.
+- 405 on PATCH/POST/DELETE: make sure you’re hitting the WS‑capable backend on 8081 started by this compose. Check `docker compose ps` and restart with `--build`.
 - WebSocket “bad response”: ensure the backend is started with the Gevent WebSocket worker (this compose does that).
 - Data missing after restart: don’t worry — with bind‑mounts, DB and uploads persist. If you were using another compose earlier, confirm you’re now running this one.
-

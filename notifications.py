@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity, get_jwt
 from datetime import datetime
 from sqlalchemy import or_, and_
+import json
 
 from extensions import db
 from models import Notification
@@ -164,13 +165,25 @@ def bulk_delete_notifications():
             allowed_filters.append(and_(Notification.user_id.is_(None), Notification.role.is_(None)))
             q = q.filter(or_(*allowed_filters))
 
-        deleted_count = q.delete(synchronize_session=False)
+        ids = [int(row.id) for row in q.with_entities(Notification.id).all()]
+        if not ids:
+            return jsonify({'ok': True, 'deleted_count': 0, 'ids': []})
+
+        deleted_count = Notification.query.filter(Notification.id.in_(ids)).delete(synchronize_session=False)
         db.session.commit()
         try:
-            ws_broadcast({'type':'notifications.bulk','resource':'notifications','action':'deleted','count':int(deleted_count),'v':1,'ts':datetime.utcnow().isoformat()+'Z'})
+            ws_broadcast({
+                'type': 'notifications.bulk',
+                'resource': 'notifications',
+                'action': 'deleted',
+                'count': int(deleted_count),
+                'ids': ids,
+                'v': 1,
+                'ts': datetime.utcnow().isoformat() + 'Z'
+            })
         except Exception:
             pass
-        return jsonify({'ok': True, 'deleted_count': int(deleted_count)})
+        return jsonify({'ok': True, 'deleted_count': int(deleted_count), 'ids': ids})
     except Exception as e:
         db.session.rollback()
         return jsonify({'error':'delete_failed','detail':str(e)}), 500

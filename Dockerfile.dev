@@ -13,8 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r requirements.txt
 
-# For dev, we’ll mount source code as a volume, so no COPY here.
+# Keep a copy of the source inside the image so the app can boot even
+# before the host volume is mounted (helps CI / first boot).
+COPY . /app
 ENV FLASK_APP=app.py \
+    PYTHONPATH=/app \
     FLASK_DEBUG=1
 
 EXPOSE 8081

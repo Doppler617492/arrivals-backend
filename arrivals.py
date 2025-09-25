@@ -9,11 +9,112 @@ from datetime import datetime
 import os, time
 
 from extensions import db
-from app import Arrival, ArrivalFile, ArrivalUpdate, ws_broadcast, notify
-from services.mailer import send_email, all_user_emails  # if available
-from app import _parse_iso, _parse_float, check_api_or_jwt, has_valid_api_key, ROLE_FIELDS, can_edit, ALLOWED_STATUSES, NOTIFY_ON_STATUS
+from models import Arrival, ArrivalFile, ArrivalUpdate
+try:
+    from services.mailer import send_email, all_user_emails  # if available
+except Exception:
+    send_email = None  # type: ignore
+    all_user_emails = None  # type: ignore
+"""Lazy app imports are used inside functions to avoid circular imports."""
 
-bp = Blueprint("arrivals", __name__, url_prefix="/api/arrivals")
+bp = Blueprint("arrivals", __name__)
+
+
+def delete_arrival_record(arrival_id: int):
+    """Remove an arrival row (and related files) and broadcast the change."""
+    a = Arrival.query.get(arrival_id)
+    if not a:
+        return jsonify({'error': 'Not found'}), 404
+
+    # optional best-effort file cleanup (keep if present)
+    try:
+        import os
+        from flask import current_app
+
+        for f in list(getattr(a, 'files', []) or []):
+            try:
+                upload_folder = (current_app.config.get('UPLOAD_FOLDER') or '')
+                if getattr(f, 'filename', None):
+                    os.remove(os.path.join(upload_folder, f.filename))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        db.session.delete(a)
+        db.session.commit()
+    except Exception as err:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return jsonify({'error': 'delete_failed', 'detail': str(err)}), 500
+
+    from datetime import datetime
+    try:
+        from app import notify
+
+        title = (a.supplier or a.plate or '').strip()
+        notify(
+            f"Dolazak obrisan (#{arrival_id}{' – ' + title if title else ''})",
+            ntype='warning',
+            event='DELETED',
+            entity_type='arrival',
+            entity_id=arrival_id,
+        )
+    except Exception:
+        pass
+    try:
+        from app import ws_broadcast  # type: ignore
+
+        ws_broadcast({
+            'type': 'arrivals.deleted',
+            'resource': 'arrivals',
+            'id': int(arrival_id),
+            'v': 1,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+        })
+    except Exception:
+        pass
+
+    return jsonify({'ok': True, 'id': int(arrival_id)}), 200
+
+
+def _parse_when(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        try:
+            return datetime.fromisoformat(str(value).replace('Z', ''))
+        except Exception:
+            try:
+                return datetime.strptime(str(value)[:10], '%Y-%m-%d')
+            except Exception:
+                return None
+
+
+def _maybe_notify_arrival_overdue(a: Arrival):
+    try:
+        eta = _parse_when(a.eta)
+        if not eta:
+            return
+        if str(a.status or '').lower() == 'arrived':
+            return
+        if eta.date() <= datetime.utcnow().date():
+            from app import notify
+
+            notify(
+                f"Rok dolaska probijen (#{a.id})",
+                ntype='warning',
+                event='DEADLINE_BREACHED',
+                entity_type='arrival',
+                entity_id=a.id,
+            )
+    except Exception:
+        pass
 
 @bp.route("", methods=["GET", "HEAD", "OPTIONS"])
 @bp.route("/", methods=["GET", "HEAD", "OPTIONS"])
@@ -86,6 +187,7 @@ def search_arrivals():
 @bp.post("/")
 @bp.post("")
 def create_arrival():
+    from app import _parse_iso, _parse_float, check_api_or_jwt, NOTIFY_ON_STATUS
     data = request.json or {}
     loc = data.get('location')
     if not loc:
@@ -115,9 +217,11 @@ def create_arrival():
             f"Novi dolazak (#{a.id}{' – ' + (a.supplier or '').strip() if (a.supplier or '').strip() else ''})",
             ntype='info', event='CREATED', dedup_key=f"arrival:{a.id}:created", entity_type='arrival', entity_id=a.id
         )
+        _maybe_notify_arrival_overdue(a)
     except Exception:
         pass
     try:
+        from app import ws_broadcast
         ws_broadcast({
             'type': 'arrivals.created',
             'resource': 'arrivals',
@@ -135,6 +239,7 @@ def create_arrival():
 def update_arrival(id):
     a = Arrival.query.get_or_404(id)
     data = request.json or {}
+    from app import _parse_iso, _parse_float, check_api_or_jwt, ROLE_FIELDS, can_edit
     attempted_fields = set(data.keys() or [])
     ok, role, uid, err = check_api_or_jwt(attempted_fields)
     if not ok: return err
@@ -175,6 +280,7 @@ def update_arrival(id):
     except Exception:
         pass
     try:
+        from app import ws_broadcast
         ws_broadcast({
             'type': 'arrivals.updated',
             'resource': 'arrivals',
@@ -186,11 +292,13 @@ def update_arrival(id):
         })
     except Exception:
         pass
+    _maybe_notify_arrival_overdue(a)
     return jsonify(a.to_dict())
 
 @bp.patch("/<int:id>/status")
 @jwt_required()
 def update_arrival_status(id):
+    from app import ALLOWED_STATUSES, NOTIFY_ON_STATUS, can_edit, ROLE_FIELDS, _parse_iso, _parse_float
     a = Arrival.query.get_or_404(id); claims=get_jwt(); uid=get_jwt_identity()
     role = claims.get('role','viewer'); user_id = int(uid) if uid is not None else None
     data=request.json or {}; attempted_fields=set(data.keys())
@@ -232,6 +340,7 @@ def update_arrival_status(id):
                 pass
     db.session.commit()
     try:
+        from app import ws_broadcast
         ws_broadcast({
             'type': 'arrivals.updated',
             'resource': 'arrivals',
@@ -243,86 +352,26 @@ def update_arrival_status(id):
         })
     except Exception:
         pass
+    _maybe_notify_arrival_overdue(a)
     return jsonify(a.to_dict())
 
+
 @bp.route("/<int:id>", methods=["DELETE", "OPTIONS"], strict_slashes=False)
-def delete_arrival(id):
-    # CORS preflight
+def delete_arrival(id: int):
     if request.method == 'OPTIONS':
         return ("", 204)
-
-    # JWT obavezan (bez role checka)
     from flask_jwt_extended import verify_jwt_in_request
     try:
         verify_jwt_in_request(optional=False)
     except Exception:
         from flask import jsonify
         return jsonify({'error': 'Unauthorized'}), 401
-
-    from models import Arrival
-    a = Arrival.query.get(id)
-    if not a:
-        from flask import jsonify
-        return jsonify({'error': 'Not found'}), 404
-
-    # Hard delete
-    from app import db, ws_broadcast
-    db.session.delete(a)
-    db.session.commit()
-
-    # Realtime event (mora imati id)
-    from datetime import datetime
-    try:
-        ws_broadcast({
-            'type': 'arrivals.deleted',
-            'resource': 'arrivals',
-            'id': int(id),
-            'v': 1,
-            'ts': datetime.utcnow().isoformat() + 'Z',
-        })
-    except Exception:
-        pass
-
-    from flask import jsonify
-    return jsonify({'ok': True, 'id': int(id)}), 200
-
-@bp.delete("/bulk_delete")
-@jwt_required(optional=True)
-def bulk_delete_arrivals():
-    payload=request.json or {}; ids=payload.get('ids') or []
-    if not isinstance(ids,list) or not all(isinstance(i,int) for i in ids):
-        return jsonify({'error':'ids must be an array of integers'}),400
-    if not (has_valid_api_key()):
-        try: verify_jwt_in_request(optional=False)
-        except Exception: return jsonify({'error':'Unauthorized'}),401
-        claims=get_jwt()
-        if (claims or {}).get('role')!='admin': return jsonify({'error':'Admin only'}),403
-    if not ids: return jsonify({'ok':True,'deleted':[]})
-    try:
-        file_rows=db.session.query(ArrivalFile.filename).filter(ArrivalFile.arrival_id.in_(ids)).all()
-        for (fname,) in file_rows:
-            try: os.remove(os.path.join(current_app.config['UPLOAD_FOLDER'],fname))
-            except Exception: pass
-    except Exception: pass
-    db.session.query(Arrival).filter(Arrival.id.in_(ids)).delete(synchronize_session=False)
-    db.session.commit()
-    try:
-        ws_broadcast({
-            'type': 'system.bulk',
-            'v': 1,
-            'ts': datetime.utcnow().isoformat() + 'Z',
-            'events': [
-                {'type':'arrivals.deleted','resource':'arrivals','action':'deleted','id': int(x), 'v':1, 'ts': datetime.utcnow().isoformat() + 'Z'}
-                for x in ids
-            ],
-        })
-    except Exception:
-        pass
-    return jsonify({'ok':True,'deleted':ids}),200
+    return delete_arrival_record(id)
 
 @bp.delete("/")
 @jwt_required(optional=True)
 def delete_arrivals_querystring():
+    from app import has_valid_api_key
     qs_ids=request.args.get('ids'); body=request.get_json(silent=True) or {}; body_ids=body.get('ids') if isinstance(body,dict) else []
     ids=[]
     if qs_ids:
@@ -347,6 +396,7 @@ def delete_arrivals_querystring():
     db.session.query(Arrival).filter(Arrival.id.in_(ids)).delete(synchronize_session=False)
     db.session.commit()
     try:
+        from app import ws_broadcast
         ws_broadcast({
             'type': 'system.bulk',
             'v': 1,
@@ -409,6 +459,7 @@ def list_files(arrival_id):
 @bp.delete("/<int:arrival_id>/files/<int:file_id>")
 @jwt_required(optional=True)
 def delete_file(arrival_id,file_id):
+    from app import has_valid_api_key
     if not (has_valid_api_key()):
         try: verify_jwt_in_request(optional=False)
         except Exception: return jsonify({'error':'Unauthorized'}),401

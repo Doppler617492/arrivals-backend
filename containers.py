@@ -5,7 +5,7 @@ from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt, verify_jwt_in_request
 from werkzeug.utils import secure_filename
 from sqlalchemy import func, or_
-from datetime import datetime
+from datetime import datetime, date
 import os, time
 
 from extensions import db
@@ -14,6 +14,30 @@ from app import _parse_iso, _parse_float, _parse_date_any, check_api_or_jwt, has
 from sqlalchemy import func, and_, or_, text
 
 bp = Blueprint("containers", __name__, url_prefix="/api/containers")
+
+
+def _maybe_notify_container_overdue(c: Container):
+    try:
+        eta = getattr(c, 'eta', None)
+        if not eta:
+            return
+        status = str(getattr(c, 'status', '')).lower()
+        if status in ('arrived', 'delivered'):
+            return
+        if isinstance(eta, date):
+            overdue = eta <= date.today()
+        else:
+            overdue = False
+        if overdue:
+            notify(
+                f"Rok kontejnera probijen (#{c.id})",
+                ntype='warning',
+                event='DEADLINE_BREACHED',
+                entity_type='container',
+                entity_id=c.id,
+            )
+    except Exception:
+        pass
 
 @bp.route("", methods=["GET", "HEAD", "OPTIONS"])
 @bp.route("/", methods=["GET", "HEAD", "OPTIONS"])
@@ -284,6 +308,7 @@ def set_paid(id):
         db.session.commit()
         try:
             notify(f"Plaćanje ažurirano (#{c.id}) → {'plaćeno' if is_paid else 'nije plaćeno'}", ntype='info', entity_type='container', entity_id=c.id)
+            _maybe_notify_container_overdue(c)
         except Exception:
             pass
         d = c.to_dict()
@@ -300,6 +325,12 @@ def set_paid(id):
         except Exception:
             pass
         return jsonify(d)
+    except Exception as e:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return jsonify({'error': 'update_failed', 'detail': str(e)}), 500
 
 @bp.post("/admin/wipe")
 def admin_wipe_containers():
@@ -354,49 +385,60 @@ def admin_duplicates():
     if role != 'admin':
         return jsonify({'error':'Forbidden'}), 403
     try:
-        year = int(request.args.get('year') or 0)
-    except Exception:
-        year = 0
-    if not year:
-        return jsonify({'error':'year_required'}), 400
-    field = (request.args.get('date_field') or 'etd').strip().lower()
-    keys_raw = (request.args.get('keys') or 'container_no,supplier').strip()
-    key_names = [k.strip() for k in keys_raw.split(',') if k.strip()]
-    # Python aggregation to avoid DB date/cast issues
-    y_from = f"{year}-01-01"; y_to = f"{year}-12-31"
-    rows = db.session.query(Container).all()
-    def _in_year(c):
         try:
-            if field=='etd' and getattr(c,'etd',None): return str(c.etd)[:4]==str(year)
-            if field=='eta' and getattr(c,'eta',None): return str(c.eta)[:4]==str(year)
-            if field=='delivery' and getattr(c,'delivery',None): return str(c.delivery)[:4]==str(year)
-            return str(getattr(c,'created_at',''))[:4]==str(year)
+            year = int(request.args.get('year') or 0)
         except Exception:
-            return False
-    def _m2n(v):
-        try:
-            s=''.join(ch for ch in str(v) if ch.isdigit() or ch in ',.-')
-            if ',' in s and '.' not in s: s=s.replace(',', '.')
-            return float(s or 0)
-        except Exception:
-            return 0.0
-    groups = {}
-    for c in rows:
-        if not _in_year(c): continue
-        key = tuple((getattr(c,k) if hasattr(c,k) else None) for k in key_names)
-        g = groups.setdefault(key, {'count':0,'total_sum':0.0})
-        g['count'] += 1
-        g['total_sum'] += _m2n(getattr(c,'total',0))
-    out=[]
-    for key,g in groups.items():
-        if g['count']>1:
-            rec={'count':g['count'],'total_sum':g['total_sum']}
-            for i,k in enumerate(key_names): rec[k]=key[i]
-            out.append(rec)
-    return jsonify({'year':year,'date_field':field,'keys':key_names,'groups':out,'groups_count':len(out)})
+            year = 0
+        if not year:
+            return jsonify({'error':'year_required'}), 400
+        field = (request.args.get('date_field') or 'etd').strip().lower()
+        keys_raw = (request.args.get('keys') or 'container_no,supplier').strip()
+        key_names = [k.strip() for k in keys_raw.split(',') if k.strip()]
+        # Python aggregation to avoid DB date/cast issues
+        rows = db.session.query(Container).all()
+
+        def _in_year(c):
+            try:
+                if field == 'etd' and getattr(c, 'etd', None):
+                    return str(c.etd)[:4] == str(year)
+                if field == 'eta' and getattr(c, 'eta', None):
+                    return str(c.eta)[:4] == str(year)
+                if field == 'delivery' and getattr(c, 'delivery', None):
+                    return str(c.delivery)[:4] == str(year)
+                return str(getattr(c, 'created_at', ''))[:4] == str(year)
+            except Exception:
+                return False
+
+        def _m2n(v):
+            try:
+                s = ''.join(ch for ch in str(v) if ch.isdigit() or ch in ',.-')
+                if ',' in s and '.' not in s:
+                    s = s.replace(',', '.')
+                return float(s or 0)
+            except Exception:
+                return 0.0
+
+        groups = {}
+        for c in rows:
+            if not _in_year(c):
+                continue
+            key = tuple((getattr(c, k) if hasattr(c, k) else None) for k in key_names)
+            g = groups.setdefault(key, {'count': 0, 'total_sum': 0.0})
+            g['count'] += 1
+            g['total_sum'] += _m2n(getattr(c, 'total', 0))
+
+        out = []
+        for key, g in groups.items():
+            if g['count'] > 1:
+                rec = {'count': g['count'], 'total_sum': g['total_sum']}
+                for i, k in enumerate(key_names):
+                    rec[k] = key[i]
+                out.append(rec)
+
+        return jsonify({'year': year, 'date_field': field, 'keys': key_names, 'groups': out, 'groups_count': len(out)})
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error":"update_failed","detail":str(e)}),500
+        return jsonify({"error": "update_failed", "detail": str(e)}), 500
 
 # Generic status setter (maps directly to c.status)
 @bp.post("/<int:id>/status")
@@ -409,6 +451,11 @@ def set_status(id):
     c.status = status
     try:
         db.session.commit()
+        try:
+            notify(f"Status kontejnera promijenjen (#{c.id}) → {status}", ntype='info', entity_type='container', entity_id=c.id)
+            _maybe_notify_container_overdue(c)
+        except Exception:
+            pass
         try:
             ws_broadcast({
                 'type': 'containers.updated',

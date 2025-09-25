@@ -1,5 +1,11 @@
-{
-  "dependencies": {
+{ "dependencies": {
+     "express": "^4.17.1",
+     "cors": "^2.8.5",
+     "body-parser": "^1.19.0",
+     "dotenv": "^10.0.0",
+     "mongoose": "^5.10.9",
+     "jsonwebtoken": "^8.5.1",
+     "bcrypt": "^5.0.1",
     "@ant-design/icons": "^6.0.2",
     "ag-grid-community": "^34.2.0",
     "ag-grid-react": "^34.2.0",
@@ -8,5 +14,5 @@
     "recharts": "^3.2.1",
     "xlsx": "^0.18.5",
     "zustand": "^5.0.8"
-  }
-}
+  } }
+

@@ -133,16 +133,25 @@ ALLOWED_ORIGINS = allowed_origins()
 from routes.core import bp as core_bp
 app.register_blueprint(core_bp, url_prefix="")
 
-# Arrivals blueprint (ensures DELETE /api/arrivals/<id> is active)
+
+# Register arrivals blueprint explicitly (single registration, robust import)
+_registered_arrivals = False
 try:
-    from arrivals import bp as arrivals_bp  # arrivals.py defines this blueprint
+    from arrivals import bp as arrivals_bp  # preferred local module
     app.register_blueprint(arrivals_bp, url_prefix="/api/arrivals")
-    print('[BOOT] Arrivals blueprint registered at /api/arrivals')
-except Exception as _arr_bp_err:
+    print('[BOOT] Arrivals blueprint registered from module "arrivals" at /api/arrivals')
+    _registered_arrivals = True
+except Exception as e1:
     try:
-        print('[BOOT] Arrivals blueprint NOT registered – DELETE may return 405:', _arr_bp_err)
-    except Exception:
-        pass
+        from routes.arrivals import bp as arrivals_bp  # fallback module path
+        app.register_blueprint(arrivals_bp, url_prefix="/api/arrivals")
+        print('[BOOT] Arrivals blueprint registered from module "routes.arrivals" at /api/arrivals')
+        _registered_arrivals = True
+    except Exception as e2:
+        try:
+            print('[BOOT][ERROR] Failed to register arrivals blueprint:', e1, '| alt:', e2)
+        except Exception:
+            pass
 
 
 
@@ -157,7 +166,7 @@ CORS(
     },
     supports_credentials=True,
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-CSRF-TOKEN"],
     expose_headers=["Content-Type", "Authorization"],
     max_age=86400,
 )
@@ -393,9 +402,10 @@ def _cors_preflight(_any):
         headers["Access-Control-Allow-Origin"] = origin
         headers["Vary"] = "Origin"
         headers["Access-Control-Allow-Credentials"] = "true"
-        headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+        headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
         headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
     return ("", 204, headers)
+
 
 # After-request hook to set CORS headers if missing
 @app.after_request
@@ -411,13 +421,25 @@ def _add_cors_fallback(resp):
         else:
             resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
+        resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN")
         resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
     else:
         # If not an allowed origin, drop wildcard if any slipped through
         if resp.headers.get("Access-Control-Allow-Origin") == "*":
             del resp.headers["Access-Control-Allow-Origin"]
     return resp
+
+# --- Diagnostics: List registered routes (for container debugging) ---
+@app.get('/__routes')
+def __routes():
+    try:
+        out = []
+        for r in sorted(app.url_map.iter_rules(), key=lambda x: str(x)):
+            methods = ','.join(sorted(m for m in (r.methods or set()) if m not in ('HEAD', 'OPTIONS')))
+            out.append({'rule': str(r), 'endpoint': r.endpoint, 'methods': methods})
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({'error': 'routes_dump_failed', 'detail': str(e)}), 500
 
 # --- Config ---
 load_config(app)
@@ -1372,7 +1394,7 @@ def arrivals_list_fallback():
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
 
@@ -1465,7 +1487,7 @@ def arrivals_update_fallback(aid):
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
 
@@ -1527,16 +1549,52 @@ def arrivals_update_fallback(aid):
         db.session.rollback()
         return jsonify({"error": "update_failed", "detail": str(e)}), 500
 
-# --- BEGIN DISABLED DELETE FALLBACK ---
-# @app.route('/api/arrivals/<int:aid>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
-def arrivals_delete_fallback_disabled(aid):
-    from flask import jsonify
-    return jsonify({'error': 'disabled'}), 404
-# --- END DISABLED DELETE FALLBACK ---
-def arrivals_delete_fallback(aid):
-    return jsonify({'error': 'disabled'}), 404
-    # Below kept for parity reference; not active.
-    # CORS preflight
+# --- Arrivals delete fallback helpers ---
+def _arrivals_delete_internal(aid: int):
+    a = Arrival.query.get(aid)
+    if not a:
+        return jsonify({'error': 'Not found'}), 404
+
+    try:
+        import os
+
+        for f in list(getattr(a, 'files', []) or []):
+            try:
+                upload_dir = (app.config.get('UPLOAD_FOLDER') or '')
+                if getattr(f, 'filename', None):
+                    os.remove(os.path.join(upload_dir, f.filename))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        db.session.delete(a)
+        db.session.commit()
+    except Exception as err:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return jsonify({'error': 'delete_failed', 'detail': str(err)}), 500
+
+    try:
+        ws_broadcast({
+            'type': 'arrivals.deleted',
+            'resource': 'arrivals',
+            'action': 'deleted',
+            'id': int(aid),
+            'v': 1,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+        })
+    except Exception:
+        pass
+
+    return jsonify({'ok': True, 'id': int(aid)}), 200
+
+
+@app.route('/api/arrivals/delete', methods=['POST', 'OPTIONS'], strict_slashes=False)
+def arrivals_delete_via_post():
     if request.method == 'OPTIONS':
         origin = request.headers.get("Origin")
         headers = {}
@@ -1544,47 +1602,30 @@ def arrivals_delete_fallback(aid):
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
 
-    # Require JWT (no role check)
+    data = request.get_json(silent=True) or {}
     try:
-        verify_jwt_in_request(optional=False)
+        aid = int(data.get('id') or data.get('arrival_id') or 0)
     except Exception:
-        return jsonify({'error': 'Unauthorized'}), 401
+        aid = 0
+    if aid <= 0:
+        return jsonify({'error': 'id_required'}), 400
 
-    a = Arrival.query.get(aid)
-    if not a:
-        return jsonify({'error': 'Not found'}), 404
+    if not has_valid_api_key():
+        try:
+            verify_jwt_in_request(optional=False)
+        except Exception:
+            return jsonify({'error': 'Unauthorized'}), 401
 
     try:
-        # Remove files best-effort
-        try:
-            for f in list(getattr(a, 'files', []) or []):
-                try:
-                    os.remove(os.path.join(app.config.get('UPLOAD_FOLDER') or '', f.filename))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        db.session.delete(a)
-        db.session.commit()
-        try:
-            ws_broadcast({
-                'type': 'arrivals.deleted',
-                'resource': 'arrivals',
-                'action': 'deleted',
-                'id': int(aid),
-                'v': 1,
-                'ts': datetime.utcnow().isoformat() + 'Z',
-            })
-        except Exception:
-            pass
-        return jsonify({'ok': True, 'id': int(aid)}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': 'delete_failed', 'detail': str(e)}), 500
+        from arrivals import delete_arrival_record as _delete_arrival_record  # type: ignore
+
+        return _delete_arrival_record(aid)
+    except Exception:
+        return _arrivals_delete_internal(aid)
 
 # Fallback: explicit status endpoint (helps clients that can't PATCH reliably)
 @app.route('/api/arrivals/<int:aid>/status', methods=['POST', 'OPTIONS'], strict_slashes=False)
@@ -1596,7 +1637,7 @@ def arrivals_status_fallback(aid):
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
     data = request.get_json(silent=True) or {}
@@ -1639,7 +1680,7 @@ def arrivals_files_fallback(arrival_id):
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
 
@@ -1740,7 +1781,6 @@ def arrivals_files_fallback(arrival_id):
         db.session.rollback()
         return jsonify({"error": "upload_failed", "detail": str(e)}), 500
 
-# Fallback: delete a single arrival file
 @app.route('/api/arrivals/<int:arrival_id>/files/<int:file_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 def arrivals_file_delete_fallback(arrival_id, file_id):
     if request.method == 'OPTIONS':
@@ -1750,7 +1790,7 @@ def arrivals_file_delete_fallback(arrival_id, file_id):
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
     rec = ArrivalFile.query.filter_by(id=file_id, arrival_id=arrival_id).first()
@@ -1813,7 +1853,7 @@ def arrivals_create_explicit():
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
 
@@ -1880,7 +1920,7 @@ def containers_list_fallback():
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
 
@@ -2093,7 +2133,7 @@ def containers_update_fallback(cid):
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
 
@@ -3161,27 +3201,8 @@ _register_blueprint(["routes.users", "users"], label="users")
 _register_blueprint(["routes.users_enterprise", "routes.enterprise_users"], label="enterprise_users")
 
 # Arrivals blueprint
-_register_blueprint(["routes.arrivals", "arrivals"], label="arrivals")
 
-# Ensure arrivals blueprint DELETE route is present; if not, explicitly register
-try:
-    def _has_arrivals_delete():
-        try:
-            for r in app.url_map.iter_rules():
-                if str(r) == '/api/arrivals/<int:id>' and ('DELETE' in (r.methods or set())):
-                    return True
-        except Exception:
-            return False
-        return False
-    if not _has_arrivals_delete():
-        try:
-            from arrivals import bp as arrivals_bp
-            app.register_blueprint(arrivals_bp, url_prefix='/api/arrivals')
-            print('[BOOT] Explicitly registered arrivals blueprint')
-        except Exception as _explicit_err:
-            print('[BOOT] Explicit arrivals blueprint register failed:', _explicit_err)
-except Exception as _ensure_err:
-    print('[BOOT] arrivals ensure failed:', _ensure_err)
+# (No additional explicit arrivals blueprint register to avoid double-registration)
 
 # Containers blueprint
 # The 'containers' blueprint in containers.py already defines url_prefix='/api/containers'.
@@ -3213,6 +3234,11 @@ try:
         arrivals_cost_structure as _an_struct,
         arrivals_list_filtered as _an_list,
         arrivals_top_suppliers as _an_top,
+        arrivals_by_category as _an_by_category,
+        arrivals_by_responsible as _an_by_responsible,
+        arrivals_by_location as _an_by_location,
+        arrivals_by_carrier as _an_by_carrier,
+        arrivals_by_agent as _an_by_agent,
         arrivals_on_time as _an_ontime,
         arrivals_lead_time as _an_lead,
         arrivals_lookups as _an_lookups,
@@ -3245,6 +3271,26 @@ try:
         @app.get('/api/analytics/arrivals/top-suppliers')
         def _an_top_fallback():
             return _an_top()
+    if not _has_get_for('/api/analytics/arrivals/by-category'):
+        @app.get('/api/analytics/arrivals/by-category')
+        def _an_by_category_fallback():
+            return _an_by_category()
+    if not _has_get_for('/api/analytics/arrivals/by-responsible'):
+        @app.get('/api/analytics/arrivals/by-responsible')
+        def _an_by_responsible_fallback():
+            return _an_by_responsible()
+    if not _has_get_for('/api/analytics/arrivals/by-location'):
+        @app.get('/api/analytics/arrivals/by-location')
+        def _an_by_location_fallback():
+            return _an_by_location()
+    if not _has_get_for('/api/analytics/arrivals/by-carrier'):
+        @app.get('/api/analytics/arrivals/by-carrier')
+        def _an_by_carrier_fallback():
+            return _an_by_carrier()
+    if not _has_get_for('/api/analytics/arrivals/by-agent'):
+        @app.get('/api/analytics/arrivals/by-agent')
+        def _an_by_agent_fallback():
+            return _an_by_agent()
     if not _has_get_for('/api/analytics/arrivals/on-time'):
         @app.get('/api/analytics/arrivals/on-time')
         def _an_ontime_fallback():
@@ -3359,7 +3405,7 @@ def health():
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
 
@@ -3446,7 +3492,7 @@ def admin_db_info():
             headers["Access-Control-Allow-Origin"] = origin
             headers["Vary"] = "Origin"
             headers["Access-Control-Allow-Credentials"] = "true"
-            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key, X-CSRF-TOKEN"
             headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
         return ("", 204, headers)
     # Allow API key or admin JWT only
