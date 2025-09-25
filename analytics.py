@@ -146,7 +146,12 @@ def _aggregate_arrivals(rows: list[Arrival], attr: str, fallback_label: str):
     fallback = fallback_label or 'Neodređeno'
     bucket = {}
     for row in rows:
-        raw = getattr(row, attr, None) if hasattr(row, attr) else None
+        if hasattr(row, attr):
+            raw = getattr(row, attr, None)
+        elif attr == 'agent' and hasattr(row, 'carrier'):
+            raw = getattr(row, 'carrier', None)
+        else:
+            raw = None
         label = raw.strip() if isinstance(raw, str) else raw
         if not label:
             label = fallback
@@ -391,6 +396,7 @@ def arrivals_list_filtered():
             eta_dt = _coerce_eta(getattr(a, 'eta', None))
             arrived_dt = _coerce_datetime(getattr(a, 'arrived_at', None))
             shipped_dt = _coerce_datetime(getattr(a, 'shipped_at', None))
+            created_dt = _coerce_datetime(getattr(a, 'created_at', None))
             items.append({
                 'id': a.id,
                 'supplier': a.supplier,
@@ -402,7 +408,12 @@ def arrivals_list_filtered():
                 'freight_cost': float(getattr(a, 'freight_cost', 0) or 0),
                 'customs_cost': float(getattr(a, 'customs_cost', 0) or 0),
                 'location': getattr(a, 'location', None),
-                'agent': getattr(a, 'agent', None) if hasattr(a, 'agent') else None,
+                'category': getattr(a, 'category', None),
+                'responsible': getattr(a, 'responsible', None),
+                'carrier': getattr(a, 'carrier', None),
+                'agent': getattr(a, 'agent', None) if hasattr(a, 'agent') else getattr(a, 'carrier', None),
+                'assignee_name': getattr(a, 'assignee_name', None),
+                'created_at': created_dt.isoformat() if created_dt else None,
             })
         return jsonify({'items': items})
     except Exception as e:
