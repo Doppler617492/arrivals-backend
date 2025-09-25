@@ -1,6 +1,8 @@
-from flask import Blueprint, request, jsonify
+from collections import defaultdict
 from datetime import datetime, timedelta
-from sqlalchemy import func, and_, or_, text
+
+from flask import Blueprint, request, jsonify
+from sqlalchemy import func
 
 try:
     from extensions import db
@@ -23,6 +25,36 @@ def _parse_iso_date(s: str | None):
         return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
     except Exception:
         return None
+
+
+def _coerce_datetime(value):
+    """Attempt to coerce various date/time representations to naive datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return None
+        try:
+            if len(v) == 10:
+                # YYYY-MM-DD
+                return datetime.fromisoformat(v)
+            return datetime.fromisoformat(v.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            # Try common fallback formats
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%d.%m.%Y"):
+                try:
+                    return datetime.strptime(v, fmt)
+                except Exception:
+                    continue
+    try:
+        if hasattr(value, "isoformat"):
+            return datetime.fromisoformat(value.isoformat()).replace(tzinfo=None)
+    except Exception:
+        pass
+    return None
 
 
 def _date_range_args():
@@ -70,25 +102,13 @@ def _arrival_cost(row: Arrival) -> float:
 
 
 def _coerce_eta(value):
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, str):
-        return _parse_iso_date(value)
-    try:
-        # Some deployments store ETA as date objects
-        if hasattr(value, 'isoformat'):
-            return datetime.fromisoformat(value.isoformat())
-    except Exception:
-        pass
-    return None
+    return _coerce_datetime(value)
 
 
 def _arrival_delay_days(row: Arrival) -> float | None:
     try:
         eta_dt = _coerce_eta(getattr(row, 'eta', None))
-        arrived_at = getattr(row, 'arrived_at', None)
+        arrived_at = _coerce_datetime(getattr(row, 'arrived_at', None))
         if not eta_dt or not arrived_at:
             return None
         return (arrived_at - eta_dt).total_seconds() / 86400.0
@@ -96,13 +116,30 @@ def _arrival_delay_days(row: Arrival) -> float | None:
         return None
 
 
+def _arrival_reference_datetime(row: Arrival):
+    """Use arrived_at if present, otherwise ETA."""
+    dt = _coerce_datetime(getattr(row, "arrived_at", None))
+    if dt:
+        return dt
+    return _coerce_eta(getattr(row, "eta", None))
+
+
 def _fetch_arrivals_scope():
     dfrom, dto = _date_range_args()
-    date_col = _arrival_date_col()
-    q = db.session.query(Arrival).filter(date_col.between(dfrom, dto))
-    q = _apply_common_filters(q)
-    rows = q.all()
+    rows = _fetch_arrivals_scope_custom(dfrom, dto)
     return rows, dfrom, dto
+
+
+def _fetch_arrivals_scope_custom(dfrom: datetime, dto: datetime):
+    base = _apply_common_filters(db.session.query(Arrival))
+    rows = []
+    for row in base.all():
+        ref_dt = _arrival_reference_datetime(row)
+        if not ref_dt:
+            continue
+        if dfrom <= ref_dt <= dto:
+            rows.append(row)
+    return rows
 
 
 def _aggregate_arrivals(rows: list[Arrival], attr: str, fallback_label: str):
@@ -222,33 +259,34 @@ def _is_paid_flag(row_paid, row_status: str | None) -> bool:
 @bp.get("/arrivals/kpi")
 def arrivals_kpi():
     try:
-        dfrom, dto = _date_range_args()
-        dcol = _arrival_date_col()
-        base = db.session.query(Arrival).filter(or_(Arrival.arrived_at.isnot(None), Arrival.eta.isnot(None)))
-        base = _apply_common_filters(base)
-        base = base.filter(dcol.between(dfrom, dto))
-
-        # Counts
+        rows, dfrom, dto = _fetch_arrivals_scope()
         today = datetime.utcnow().date()
-        today_cnt = base.filter(func.date(Arrival.eta) == today).count()
-        in_transit = base.filter(Arrival.status == 'shipped').count()
-        arrived = base.filter(Arrival.status == 'arrived').count()
-
-        # Total cost in current month (or within window)
         month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        cost_q = _apply_common_filters(db.session.query(
-            func.coalesce(func.sum(func.coalesce(Arrival.goods_cost,0) + func.coalesce(Arrival.freight_cost,0) + func.coalesce(Arrival.customs_cost,0)), 0)
-        ))
-        cost_q = cost_q.filter(_arrival_date_col() >= month_start)
-        total_cost_month = float(cost_q.scalar() or 0.0)
 
-        # Total/avg cost in window (YTD when called with from/to as current year)
-        win_cost_q = _apply_common_filters(db.session.query(
-            func.coalesce(func.sum(func.coalesce(Arrival.goods_cost,0) + func.coalesce(Arrival.freight_cost,0) + func.coalesce(Arrival.customs_cost,0)), 0)
-        ))
-        win_cost_q = win_cost_q.filter(_arrival_date_col().between(dfrom, dto))
-        total_cost_window = float(win_cost_q.scalar() or 0.0)
-        count_window = base.count()
+        today_cnt = 0
+        in_transit = 0
+        arrived = 0
+        total_cost_window = 0.0
+        total_cost_month = 0.0
+
+        for row in rows:
+            status = (row.status or '').lower()
+            if status == 'shipped':
+                in_transit += 1
+            if status == 'arrived':
+                arrived += 1
+
+            eta_dt = _coerce_eta(getattr(row, 'eta', None))
+            if eta_dt and eta_dt.date() == today:
+                today_cnt += 1
+
+            ref_dt = _arrival_reference_datetime(row)
+            cost = _arrival_cost(row)
+            total_cost_window += cost
+            if ref_dt and ref_dt >= month_start:
+                total_cost_month += cost
+
+        count_window = len(rows)
         avg_cost_window = (total_cost_window / count_window) if count_window else 0.0
 
         return jsonify({
@@ -268,29 +306,34 @@ def arrivals_kpi():
 @bp.get("/arrivals/trend-costs")
 def arrivals_trend_costs():
     try:
-        dfrom, dto = _date_range_args()
+        rows, _, _ = _fetch_arrivals_scope()
         gran = (request.args.get('granularity') or 'month').lower()
-        if gran not in ('month','week','day'):
+        if gran not in ('month', 'week', 'day'):
             gran = 'month'
-        # Choose date to bucket: arrived_at or cast(eta)
-        date_col = _arrival_date_col()
-        if gran == 'day':
-            bucket = func.date(date_col)
-        elif gran == 'week':
-            bucket = func.date_trunc('week', date_col)
-        else:
-            bucket = func.date_trunc('month', date_col)
 
-        q = db.session.query(
-            bucket.label('period'),
-            func.coalesce(func.sum(func.coalesce(Arrival.goods_cost,0) + func.coalesce(Arrival.freight_cost,0) + func.coalesce(Arrival.customs_cost,0)), 0).label('total')
-        )
-        q = q.filter(date_col.between(dfrom, dto))
-        q = _apply_common_filters(q)
-        q = q.group_by(bucket).order_by(bucket)
-        rows = q.all()
-        data = [{ 'period': (r.period.date().isoformat() if hasattr(r.period,'date') else str(r.period)), 'total': float(r.total) } for r in rows]
-        return jsonify({'items': data})
+        buckets: dict[datetime, float] = defaultdict(float)
+
+        for row in rows:
+            ref = _arrival_reference_datetime(row)
+            if not ref:
+                continue
+            if gran == 'day':
+                key = datetime(ref.year, ref.month, ref.day)
+            elif gran == 'week':
+                monday = ref - timedelta(days=ref.weekday())
+                key = datetime(monday.year, monday.month, monday.day)
+            else:
+                key = datetime(ref.year, ref.month, 1)
+            buckets[key] += _arrival_cost(row)
+
+        items = []
+        for key in sorted(buckets.keys()):
+            if gran == 'month':
+                label = key.strftime('%Y-%m')
+            else:
+                label = key.strftime('%Y-%m-%d')
+            items.append({'period': label, 'total': float(buckets[key])})
+        return jsonify({'items': items})
     except Exception as e:
         return jsonify({'error':'analytics_trend_failed','detail':str(e)}), 500
 
@@ -298,18 +341,14 @@ def arrivals_trend_costs():
 @bp.get("/arrivals/cost-structure")
 def arrivals_cost_structure():
     try:
-        dfrom, dto = _date_range_args()
-        q = db.session.query(
-            func.coalesce(func.sum(Arrival.goods_cost), 0).label('goods'),
-            func.coalesce(func.sum(Arrival.freight_cost), 0).label('freight'),
-            func.coalesce(func.sum(Arrival.customs_cost), 0).label('customs')
-        )
-        q = _apply_common_filters(q)
-        q = q.filter(_arrival_date_col().between(dfrom, dto))
-        row = q.first()
-        goods = float(row.goods or 0.0)
-        freight = float(row.freight or 0.0)
-        customs = float(row.customs or 0.0)
+        rows, _, _ = _fetch_arrivals_scope()
+        goods = 0.0
+        freight = 0.0
+        customs = 0.0
+        for row in rows:
+            goods += float(getattr(row, 'goods_cost', 0) or 0)
+            freight += float(getattr(row, 'freight_cost', 0) or 0)
+            customs += float(getattr(row, 'customs_cost', 0) or 0)
         total = goods + freight + customs
         return jsonify({
             'goods': goods,
@@ -333,33 +372,32 @@ def arrivals_list_filtered():
     """
     try:
         dfrom, dto = _date_range_args()
-        # Optional override for period via exact month (YYYY-MM)
         month = (request.args.get('month') or '').strip()
-        if month and len(month) == 7:  # YYYY-MM
+        if month and len(month) == 7:
             try:
-                y, m = month.split('-')
-                y, m = int(y), int(m)
+                y, m = map(int, month.split('-'))
                 dfrom = datetime(y, m, 1)
                 if m == 12:
-                    dto = datetime(y+1, 1, 1) - timedelta(seconds=1)
+                    dto = datetime(y + 1, 1, 1) - timedelta(seconds=1)
                 else:
-                    dto = datetime(y, m+1, 1) - timedelta(seconds=1)
+                    dto = datetime(y, m + 1, 1) - timedelta(seconds=1)
             except Exception:
                 pass
 
-        date_col = _arrival_date_col()
-        q = db.session.query(Arrival).filter(date_col.between(dfrom, dto))
-        q = _apply_common_filters(q)
-        rows = q.order_by(date_col.desc()).limit(1000).all()
+        rows = _fetch_arrivals_scope_custom(dfrom, dto)
+        rows = sorted(rows, key=lambda r: (_arrival_reference_datetime(r) or dfrom), reverse=True)[:1000]
         items = []
         for a in rows:
+            eta_dt = _coerce_eta(getattr(a, 'eta', None))
+            arrived_dt = _coerce_datetime(getattr(a, 'arrived_at', None))
+            shipped_dt = _coerce_datetime(getattr(a, 'shipped_at', None))
             items.append({
                 'id': a.id,
                 'supplier': a.supplier,
                 'status': a.status,
-                'eta': a.eta.isoformat() if getattr(a, 'eta', None) else None,
-                'arrived_at': a.arrived_at.isoformat() if getattr(a, 'arrived_at', None) else None,
-                'shipped_at': a.shipped_at.isoformat() if getattr(a, 'shipped_at', None) else None,
+                'eta': eta_dt.isoformat() if eta_dt else (a.eta if isinstance(getattr(a, 'eta', None), str) else None),
+                'arrived_at': arrived_dt.isoformat() if arrived_dt else None,
+                'shipped_at': shipped_dt.isoformat() if shipped_dt else None,
                 'goods_cost': float(getattr(a, 'goods_cost', 0) or 0),
                 'freight_cost': float(getattr(a, 'freight_cost', 0) or 0),
                 'customs_cost': float(getattr(a, 'customs_cost', 0) or 0),
@@ -374,21 +412,35 @@ def arrivals_list_filtered():
 @bp.get("/arrivals/top-suppliers")
 def arrivals_top_suppliers():
     try:
-        dfrom, dto = _date_range_args()
+        rows, _, _ = _fetch_arrivals_scope()
         limit = int((request.args.get('limit') or 10))
-        date_col = func.coalesce(Arrival.arrived_at, Arrival.eta)
-        total_cost = (func.coalesce(Arrival.goods_cost,0) + func.coalesce(Arrival.freight_cost,0) + func.coalesce(Arrival.customs_cost,0))
-        q = db.session.query(
-            (Arrival.supplier).label('supplier'),
-            func.count(Arrival.id).label('count'),
-            func.coalesce(func.sum(total_cost),0).label('total'),
-            func.coalesce(func.avg(func.greatest(func.extract('epoch', Arrival.arrived_at - Arrival.eta)/3600.0, 0)), 0).label('avg_delay_h')
-        )
-        q = q.filter(date_col.between(dfrom, dto))
-        q = _apply_common_filters(q)
-        q = q.group_by(Arrival.supplier).order_by(text('total DESC NULLS LAST')).limit(limit)
-        rows = q.all()
-        data = [{ 'supplier': (r.supplier or '—'), 'count': int(r.count or 0), 'total': float(r.total or 0), 'avg_delay_h': float(r.avg_delay_h or 0)} for r in rows]
+        agg = {}
+        for row in rows:
+            supplier = row.supplier or '—'
+            stats = agg.setdefault(supplier, {
+                'supplier': supplier,
+                'count': 0,
+                'total': 0.0,
+                'delay_samples': [],
+            })
+            stats['count'] += 1
+            stats['total'] += _arrival_cost(row)
+            delay_days = _arrival_delay_days(row)
+            if delay_days and delay_days > 0:
+                stats['delay_samples'].append(delay_days * 24.0)
+
+        data = []
+        for stats in agg.values():
+            delays = stats['delay_samples']
+            avg_delay_h = sum(delays) / len(delays) if delays else 0.0
+            data.append({
+                'supplier': stats['supplier'],
+                'count': int(stats['count']),
+                'total': float(stats['total']),
+                'avg_delay_h': float(avg_delay_h),
+            })
+        data.sort(key=lambda x: x['total'], reverse=True)
+        data = data[:limit]
         return jsonify({'items': data, 'limit': limit})
     except Exception as e:
         return jsonify({'error':'analytics_top_suppliers_failed','detail':str(e)}), 500
@@ -425,27 +477,41 @@ def costs_series():
     Period is 'YYYY-MM'. Applies same common filters.
     """
     try:
-        dfrom, dto = _date_range_args()
-        # Bucket by month using coalesce(arrived_at, eta)
-        date_col = _arrival_date_col()
-        bucket = func.date_trunc('month', date_col)
-        q = db.session.query(
-            bucket.label('period'),
-            func.coalesce(func.sum(func.coalesce(Arrival.goods_cost,0)), 0).label('goods'),
-            func.coalesce(func.sum(func.coalesce(Arrival.freight_cost,0)), 0).label('freight'),
-            func.coalesce(func.sum(func.coalesce(Arrival.customs_cost,0)), 0).label('customs'),
-            func.coalesce(func.avg(func.coalesce(Arrival.freight_cost,0)), 0).label('avg_freight')
-        ).filter(date_col.between(dfrom, dto))
-        q = _apply_common_filters(q)
-        q = q.group_by(bucket).order_by(bucket)
-        rows = q.all()
-        items = [{
-            'period': (r.period.date().isoformat() if hasattr(r.period,'date') else str(r.period))[:7],
-            'goods': float(r.goods or 0),
-            'freight': float(r.freight or 0),
-            'customs': float(r.customs or 0),
-            'avg_freight': float(r.avg_freight or 0),
-        } for r in rows]
+        rows, _, _ = _fetch_arrivals_scope()
+        buckets: dict[datetime, dict[str, float]] = {}
+
+        for row in rows:
+            ref = _arrival_reference_datetime(row)
+            if not ref:
+                continue
+            key = datetime(ref.year, ref.month, 1)
+            stats = buckets.setdefault(key, {
+                'goods': 0.0,
+                'freight': 0.0,
+                'customs': 0.0,
+                'freight_samples': [],
+            })
+            goods = float(getattr(row, 'goods_cost', 0) or 0)
+            freight = float(getattr(row, 'freight_cost', 0) or 0)
+            customs = float(getattr(row, 'customs_cost', 0) or 0)
+            stats['goods'] += goods
+            stats['freight'] += freight
+            stats['customs'] += customs
+            if freight:
+                stats['freight_samples'].append(freight)
+
+        items = []
+        for key in sorted(buckets.keys()):
+            stats = buckets[key]
+            samples = stats['freight_samples']
+            avg_freight = (sum(samples) / len(samples)) if samples else 0.0
+            items.append({
+                'period': key.strftime('%Y-%m'),
+                'goods': float(stats['goods']),
+                'freight': float(stats['freight']),
+                'customs': float(stats['customs']),
+                'avg_freight': float(avg_freight),
+            })
         return jsonify({'items': items})
     except Exception as e:
         return jsonify({'error':'costs_series_failed','detail':str(e)}), 500
@@ -455,26 +521,21 @@ def costs_series():
 def arrivals_trend_status():
     """Status breakdown per month for arrivals: counts of not_shipped, shipped, arrived."""
     try:
-        dfrom, dto = _date_range_args()
-        date_col = _arrival_date_col()
-        bucket = func.date_trunc('month', date_col)
-        base = db.session.query(bucket.label('period'), Arrival.status, func.count(Arrival.id).label('cnt'))
-        base = base.filter(date_col.between(dfrom, dto))
-        base = _apply_common_filters(base)
-        base = base.group_by(bucket, Arrival.status).order_by(bucket)
-        rows = base.all()
-        # Aggregate into dict by period
-        agg = {}
-        for period, status, cnt in rows:
-            key = (period.date().isoformat() if hasattr(period,'date') else str(period))[:7]
+        rows, _, _ = _fetch_arrivals_scope()
+        agg: dict[str, dict[str, int]] = {}
+        for row in rows:
+            ref = _arrival_reference_datetime(row)
+            if not ref:
+                continue
+            key = ref.strftime('%Y-%m')
             rec = agg.setdefault(key, {'period': key, 'not_shipped': 0, 'shipped': 0, 'arrived': 0})
-            st = (status or '').lower()
-            if st in ('not_shipped','not shipped','najavljeno'):
-                rec['not_shipped'] += int(cnt or 0)
-            elif st in ('shipped','u transportu','transport'):
-                rec['shipped'] += int(cnt or 0)
-            elif st in ('arrived','stiglo'):
-                rec['arrived'] += int(cnt or 0)
+            st = (row.status or '').lower()
+            if st in ('not_shipped', 'not shipped', 'najavljeno'):
+                rec['not_shipped'] += 1
+            elif st in ('shipped', 'u transportu', 'transport'):
+                rec['shipped'] += 1
+            elif st in ('arrived', 'stiglo'):
+                rec['arrived'] += 1
         items = [agg[k] for k in sorted(agg.keys())]
         return jsonify({'items': items})
     except Exception as e:
@@ -712,26 +773,25 @@ def containers_lookups():
 @bp.get("/arrivals/on-time")
 def arrivals_on_time():
     try:
-        dfrom, dto = _date_range_args()
-        date_col = func.coalesce(Arrival.arrived_at, Arrival.eta)
-        q = db.session.query(Arrival).filter(date_col.between(dfrom, dto))
-        q = _apply_common_filters(q)
-        rows = q.all()
+        rows, _, _ = _fetch_arrivals_scope()
         total = len(rows)
         on_time = 0
         early = 0
         late = 0
         for a in rows:
-            if not a.eta or not a.arrived_at:
+            eta_dt = _coerce_eta(getattr(a, 'eta', None))
+            arrived_dt = _coerce_datetime(getattr(a, 'arrived_at', None))
+            if not eta_dt or not arrived_dt:
                 continue
-            diff = (a.arrived_at - a.eta).total_seconds()
+            diff = (arrived_dt - eta_dt).total_seconds()
             if diff < 0:
                 early += 1
             elif diff == 0:
                 on_time += 1
             else:
                 late += 1
-        rate = (on_time + early) / total if total else 0.0  # early smatramo "na vrijeme ili prije roka"
+        considered = on_time + early + late
+        rate = ((on_time + early) / considered) if considered else 0.0
         return jsonify({'total': total, 'on_time_or_early_rate': rate, 'buckets': {'early': early, 'on_time': on_time, 'late': late}})
     except Exception as e:
         return jsonify({'error':'analytics_on_time_failed','detail':str(e)}), 500
@@ -740,16 +800,13 @@ def arrivals_on_time():
 @bp.get("/arrivals/lead-time")
 def arrivals_lead_time():
     try:
-        dfrom, dto = _date_range_args()
-        date_col = func.coalesce(Arrival.arrived_at, Arrival.eta)
-        q = db.session.query(Arrival).filter(date_col.between(dfrom, dto))
-        q = _apply_common_filters(q)
-        rows = q.all()
+        rows, _, _ = _fetch_arrivals_scope()
         values = []
         for a in rows:
-            if a.shipped_at and (a.arrived_at or a.eta):
-                stop = a.arrived_at or a.eta
-                values.append((stop - a.shipped_at).total_seconds() / 86400.0)
+            shipped = _coerce_datetime(getattr(a, 'shipped_at', None))
+            stop = _coerce_datetime(getattr(a, 'arrived_at', None)) or _coerce_eta(getattr(a, 'eta', None))
+            if shipped and stop:
+                values.append((stop - shipped).total_seconds() / 86400.0)
         avg_days = sum(values)/len(values) if values else 0.0
         p95 = sorted(values)[int(0.95*len(values))] if values else 0.0
         return jsonify({'count': len(values), 'avg_days': avg_days, 'p95_days': p95})
