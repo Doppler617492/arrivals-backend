@@ -20,6 +20,7 @@ services:
       - MAIL_DEBUG=0
       - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://arrivals:supersecretchangeit@db:5432/arrivals}
       - UPLOAD_DIR=/app/uploads
+      - AUTO_CREATE_TABLES=0
       - API_KEY=devkey123
       - ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
       - LOG_HTTP=1

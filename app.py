@@ -1174,7 +1174,11 @@ from models import (
 )
 
 # Create missing tables in development by default to avoid 500s on first run
-if os.environ.get('AUTO_CREATE_TABLES', '1').lower() in ('1','true','yes','on'):
+_auto_create_tables = os.environ.get('AUTO_CREATE_TABLES', '0').lower()
+if (
+    _auto_create_tables in ('1','true','yes','on')
+    and os.environ.get('ALEMBIC_SKIP_BOOTSTRAP', '0').lower() not in ('1','true','yes','on')
+):
     try:
         with app.app_context():
             db.create_all()

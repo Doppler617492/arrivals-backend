@@ -47,6 +47,23 @@ rm -rf data/pg
 docker compose up --build
 ```
 
+## Database migrations (Alembic)
+
+- **Cold start a new database** – create a Postgres database and run:
+  ```
+  make -C arrivals-backend cold-start DATABASE_URL=postgresql+psycopg://user:pass@host:5432/dbname
+  ```
+- **Adopt an existing (pre-Alembic) database** – mark it at the initial revision then apply the latest migrations:
+  ```
+  make -C arrivals-backend adopt-db DATABASE_URL=postgresql+psycopg://user:pass@host:5432/dbname
+  ```
+- **Show current revision**:
+  ```
+  make -C arrivals-backend alembic-current DATABASE_URL=postgresql+psycopg://user:pass@host:5432/dbname
+  ```
+
+All targets export `AUTO_CREATE_TABLES=0` and `ALEMBIC_SKIP_BOOTSTRAP=1`, so the app never falls back to `db.create_all()` during migrations.
+
 ## Backup / Restore (basic)
 - Backup (on host):
 ```
