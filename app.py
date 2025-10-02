@@ -93,6 +93,10 @@ except Exception:
 
 app = Flask(__name__)
 
+# Allow opting into legacy create_all bootstrap in dev environments. By default
+# we rely purely on Alembic migrations.
+AUTO_CREATE_TABLES_ENABLED = (os.environ.get('AUTO_CREATE_TABLES', '0') or '').strip().lower() in ('1','true','yes','on')
+
 # --- Logging (JSON/structured) ---
 def _configure_logging():
     try:
@@ -1173,74 +1177,7 @@ from models import (
     Session as Session,
 )
 
-# Create missing tables in development by default to avoid 500s on first run
-_auto_create_tables = os.environ.get('AUTO_CREATE_TABLES', '0').lower()
-if (
-    _auto_create_tables in ('1','true','yes','on')
-    and os.environ.get('ALEMBIC_SKIP_BOOTSTRAP', '0').lower() not in ('1','true','yes','on')
-):
-    try:
-        with app.app_context():
-            db.create_all()
-            # Optionally seed admin and migrate user passwords
-            try:
-                from sqlalchemy import inspect
-                insp = inspect(db.engine)
-                # Ensure users.password_hash exists
-                try:
-                    cols = [c['name'] for c in insp.get_columns('users')]
-                    if 'password_hash' not in cols:
-                        db.session.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255)"))
-                        db.session.commit()
-                        print('[BOOTSTRAP] Added users.password_hash')
-                except Exception as e:
-                    print('[BOOTSTRAP] Inspect/add users.password_hash skipped:', e)
-                # Ensure arrivals.category exists for category support
-                try:
-                    a_cols = [c['name'] for c in insp.get_columns('arrivals')]
-                    if 'category' not in a_cols:
-                        db.session.execute(text("ALTER TABLE arrivals ADD COLUMN category VARCHAR(255)"))
-                        db.session.commit()
-                        print('[BOOTSTRAP] Added arrivals.category')
-                except Exception as e:
-                    print('[BOOTSTRAP] Inspect/add arrivals.category skipped:', e)
-                # Ensure notifications.event & dedup_key
-                try:
-                    n_cols = [c['name'] for c in insp.get_columns('notifications')]
-                    if 'event' not in n_cols:
-                        db.session.execute(text("ALTER TABLE notifications ADD COLUMN event VARCHAR(64)"))
-                        db.session.commit()
-                        print('[BOOTSTRAP] Added notifications.event')
-                    if 'dedup_key' not in n_cols:
-                        db.session.execute(text("ALTER TABLE notifications ADD COLUMN dedup_key VARCHAR(255)"))
-                        try:
-                            db.session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_dedup_key ON notifications (dedup_key)"))
-                        except Exception:
-                            pass
-                        db.session.commit()
-                        print('[BOOTSTRAP] Added notifications.dedup_key')
-                except Exception as e:
-                    print('[BOOTSTRAP] Inspect/add notifications columns skipped:', e)
-                # Migrate legacy plaintext passwords
-                try:
-                    from werkzeug.security import generate_password_hash
-                    rows = db.session.execute(text("SELECT id, password, password_hash FROM users")).fetchall()
-                    for r in rows:
-                        uid = r[0]; pwd = r[1]; ph = r[2]
-                        if pwd and (not ph or not str(ph).strip()):
-                            s = str(pwd)
-                            h = s if s.startswith('pbkdf2:') else generate_password_hash(s)
-                            db.session.execute(text("UPDATE users SET password_hash = :h, password = NULL WHERE id = :id"), { 'h': h, 'id': uid })
-                    db.session.commit()
-                    print('[BOOTSTRAP] Migrated users.password -> users.password_hash')
-                except Exception as e:
-                    print('[BOOTSTRAP] Password migration failed:', e)
-                # Ensure admin
-                ensure_admin()
-            except Exception as e:
-                print('[SEED] ensure_admin failed:', e)
-    except Exception as e:
-        print('[DB INIT] create_all failed:', e)
+# Legacy bootstrap helper removed – use Alembic initial migration instead
 
 # --- Role permissions ---
 ROLE_FIELDS = {
@@ -3612,14 +3549,15 @@ if not (_has_endpoint("auth.me") or _has_endpoint("me") or _has_endpoint("auth_m
             return jsonify({'error': 'Auth check failed', 'detail': str(e)}), 401
 
 # --- App bootstrap ---
-if os.environ.get("ALEMBIC_SKIP_BOOTSTRAP") != "1":
+if os.environ.get("ALEMBIC_SKIP_BOOTSTRAP", "0").lower() not in ('1','true','yes','on'):
     with app.app_context():
-        # Dev/first-run convenience: ensure tables exist. In production prefer Alembic.
-        try:
-            db.create_all()
-            print("[BOOTSTRAP] db.create_all() completed")
-        except Exception as e:
-            print("[BOOTSTRAP ERROR] create_all failed:", e)
+        # Dev/first-run convenience: optionally create tables. Production uses Alembic.
+        if AUTO_CREATE_TABLES_ENABLED:
+            try:
+                db.create_all()
+                print("[BOOTSTRAP] db.create_all() completed")
+            except Exception as e:
+                print("[BOOTSTRAP ERROR] create_all failed:", e)
         # Ensure Notification.role column exists (soft migration for existing DBs)
         try:
             from sqlalchemy import inspect as _inspect
