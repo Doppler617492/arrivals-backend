@@ -5,11 +5,13 @@ from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt, verify_jwt_in_request
 from werkzeug.utils import secure_filename
 from sqlalchemy import func, or_
+from sqlalchemy.orm import selectinload
 from datetime import datetime
 import os, time
 
 from extensions import db
-from models import Arrival, ArrivalFile, ArrivalUpdate
+from models import Arrival, ArrivalFile, ArrivalUpdate, ArrivalSupplier, Supplier, ArrivalCountry
+from countries import EUROPEAN_COUNTRY_CODES
 try:
     from services.mailer import send_email, all_user_emails  # if available
 except Exception:
@@ -18,6 +20,147 @@ except Exception:
 """Lazy app imports are used inside functions to avoid circular imports."""
 
 bp = Blueprint("arrivals", __name__)
+
+
+ALLOWED_SUPPLIER_CURRENCIES = {"EUR"}
+DEFAULT_SUPPLIER_CURRENCY = "EUR"
+
+
+class SupplierPayloadError(ValueError):
+    def __init__(self, message: str, code: str = "invalid_suppliers") -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+class CountryPayloadError(ValueError):
+    def __init__(self, message: str, code: str = "invalid_country") -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+def _normalize_country_code(raw: str | None) -> str | None:
+    """Return an uppercased ISO-2 code or ``None`` if empty.
+
+    Raises ``ValueError`` if the code is not part of the European list.
+    """
+
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("invalid_country")
+    code = raw.strip().upper()
+    if not code:
+        return None
+    if code not in EUROPEAN_COUNTRY_CODES:
+        raise ValueError("invalid_country")
+    return code
+
+
+def _normalize_country_list(raw) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        items = raw
+    else:
+        items = [raw]
+    codes: list[str] = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, str) and not item.strip():
+            continue
+        try:
+            code = _normalize_country_code(item)
+        except ValueError:
+            raise CountryPayloadError("neispravan kod države", "invalid_country")
+        if not code:
+            continue
+        if code in codes:
+            raise CountryPayloadError("Zemlja je već dodata", "duplicate_country")
+        codes.append(code)
+    return codes
+
+
+def _prepare_suppliers_payload(raw_items, parse_float):
+    """Validate and normalize the incoming supplier payload."""
+
+    if raw_items is None:
+        return []
+    if not isinstance(raw_items, list):
+        raise SupplierPayloadError("Lista dobavljača mora biti niz objekata", "invalid_suppliers")
+
+    prepared = []
+    seen_ids = set()
+    for idx, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            raise SupplierPayloadError(f"Stavka #{idx + 1} mora biti objekat", "invalid_suppliers")
+
+        supplier_id = item.get("supplier_id")
+        if supplier_id is None:
+            supplier_id = item.get("id")
+        try:
+            supplier_id_int = int(supplier_id)
+        except (TypeError, ValueError):
+            raise SupplierPayloadError(f"Neispravan supplier_id u stavci #{idx + 1}", "invalid_supplier_id")
+
+        if supplier_id_int in seen_ids:
+            raise SupplierPayloadError("Dobavljač je naveden više puta", "duplicate_supplier")
+        seen_ids.add(supplier_id_int)
+
+        supplier_obj = db.session.get(Supplier, supplier_id_int)
+        if not supplier_obj:
+            raise SupplierPayloadError(f"Dobavljač #{supplier_id_int} ne postoji", "supplier_not_found")
+
+        raw_value = item.get("value")
+        if raw_value is None:
+            raw_value = item.get("goods_value")
+        value = parse_float(raw_value)
+
+        currency_raw = item.get("currency") or supplier_obj.default_currency or DEFAULT_SUPPLIER_CURRENCY
+        currency = str(currency_raw).strip().upper() if currency_raw else DEFAULT_SUPPLIER_CURRENCY
+        if currency not in ALLOWED_SUPPLIER_CURRENCIES:
+            raise SupplierPayloadError(f"Valuta '{currency}' trenutno nije podržana", "invalid_currency")
+
+        note_raw = item.get("note")
+        note = note_raw.strip() if isinstance(note_raw, str) and note_raw.strip() else None
+
+        prepared.append({
+            "supplier": supplier_obj,
+            "supplier_id": supplier_id_int,
+            "value": value,
+            "currency": currency,
+            "note": note,
+        })
+
+    return prepared
+
+
+def _dedup_join_supplier_names(links):
+    names = []
+    for link in links or []:
+        supplier = getattr(link, "supplier", None)
+        if supplier and supplier.name:
+            names.append(supplier.name)
+    if not names:
+        return ""
+    deduped = list(dict.fromkeys(names))
+    return ", ".join(deduped)
+
+
+def _recalculate_arrival_supplier_totals(a: Arrival) -> float:
+    links = list(getattr(a, "suppliers", []) or [])
+    total = 0.0
+    for link in links:
+        try:
+            value = float(link.goods_value or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        total += value
+    if links:
+        a.goods_cost = total
+    return total
 
 
 def delete_arrival_record(arrival_id: int):
@@ -121,7 +264,13 @@ def _maybe_notify_arrival_overdue(a: Arrival):
 def list_arrivals():
     if request.method == "OPTIONS":
         return ("", 204)
-    arrivals = Arrival.query.order_by(Arrival.created_at.desc()).all()
+    arrivals = (
+        Arrival.query.options(
+            selectinload(Arrival.suppliers).selectinload(ArrivalSupplier.supplier)
+        )
+        .order_by(Arrival.created_at.desc())
+        .all()
+    )
     counts_map = dict(
         db.session.query(ArrivalFile.arrival_id, func.count(ArrivalFile.id))
         .group_by(ArrivalFile.arrival_id).all()
@@ -135,7 +284,11 @@ def list_arrivals():
 
 @bp.get("/<int:id>")
 def get_arrival(id):
-    a = Arrival.query.get_or_404(id)
+    a = (
+        Arrival.query.options(
+            selectinload(Arrival.suppliers).selectinload(ArrivalSupplier.supplier)
+        ).get_or_404(id)
+    )
     d = a.to_dict()
     d["files_count"] = db.session.query(func.count(ArrivalFile.id)).filter(ArrivalFile.arrival_id == a.id).scalar() or 0
     return jsonify(d)
@@ -156,7 +309,9 @@ def search_arrivals():
     sort_field_map = {'created_at': Arrival.created_at, 'supplier': Arrival.supplier, 'status': Arrival.status}
     sort_col = sort_field_map.get(sort, Arrival.created_at)
     sort_expr = sort_col.desc() if order != 'asc' else sort_col.asc()
-    query = Arrival.query
+    query = Arrival.query.options(
+        selectinload(Arrival.suppliers).selectinload(ArrivalSupplier.supplier)
+    )
     if status: query = query.filter(Arrival.status == status)
     if supplier: query = query.filter(Arrival.supplier.ilike(f"%{supplier}%"))
     if q: query = query.filter(or_(Arrival.plate.ilike(f"%{q}%"), Arrival.carrier.ilike(f"%{q}%")))
@@ -197,6 +352,17 @@ def create_arrival():
     attempted_fields = set(data.keys() or [])
     ok, role, uid, err = check_api_or_jwt(attempted_fields)
     if not ok: return err
+    try:
+        countries_payload = _normalize_country_list(data.get('countries'))
+        if not countries_payload and data.get('country') is not None:
+            countries_payload = _normalize_country_list(data.get('country'))
+    except CountryPayloadError as exc:
+        return jsonify({'error': exc.code, 'message': exc.message}), 400
+    try:
+        suppliers_payload = _prepare_suppliers_payload(data.get('suppliers'), _parse_float)
+    except SupplierPayloadError as exc:
+        return jsonify({'error': exc.code, 'message': exc.message}), 400
+    primary_country = countries_payload[0] if countries_payload else None
     a = Arrival(
         supplier=data.get('supplier'), carrier=data.get('carrier'), plate=data.get('plate'),
         driver=data.get('driver'), pickup_date=_parse_iso(data.get('pickup_date')), type=data.get('type','truck'),
@@ -207,9 +373,39 @@ def create_arrival():
         customs_info=data.get('customs_info'), freight_cost=_parse_float(data.get('freight_cost')),
         goods_cost=_parse_float(data.get('goods_cost')), customs_cost=_parse_float(data.get('customs_cost')),
         currency=(data.get('currency') or 'EUR')[:8], responsible=data.get('responsible'),
-        location=loc, assignee_id=data.get('assignee_id')
+        location=loc, assignee_id=data.get('assignee_id'),
+        country=primary_country,
     )
-    db.session.add(a); db.session.commit()
+    try:
+        db.session.add(a)
+        for entry in suppliers_payload:
+            link = ArrivalSupplier(
+                supplier_id=entry['supplier_id'],
+                supplier=entry['supplier'],
+                goods_value=entry['value'],
+                currency=entry['currency'],
+                note=entry['note'],
+            )
+            a.suppliers.append(link)
+        if suppliers_payload:
+            a.supplier = _dedup_join_supplier_names(a.suppliers)
+        if countries_payload:
+            for code in countries_payload:
+                a.countries.append(ArrivalCountry(code=code))
+            a.country = countries_payload[0]
+        supplier_total = _recalculate_arrival_supplier_totals(a)
+        if not suppliers_payload:
+            try:
+                a.goods_cost = _parse_float(data.get('goods_cost'))
+            except Exception:
+                pass
+        db.session.commit()
+    except Exception as e:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return jsonify({'error': 'create_failed', 'detail': str(e)}), 500
     try:
         # CREATED notification with dedup key
         from app import notify
@@ -257,6 +453,21 @@ def update_arrival(id):
         elif 'assignee' in data and can_set('responsible'): data['responsible']=data.get('assignee')
     for _k in ('responsible','location'):
         if _k in data and isinstance(data[_k],str): data[_k]=data[_k].strip()
+    suppliers_payload = None
+    if 'suppliers' in data and can_set('suppliers'):
+        try:
+            suppliers_payload = _prepare_suppliers_payload(data.get('suppliers'), _parse_float)
+        except SupplierPayloadError as exc:
+            return jsonify({'error': exc.code, 'message': exc.message}), 400
+    countries_payload = None
+    if ('countries' in data or 'country' in data) and can_set('country'):
+        raw_countries = data.get('countries')
+        if raw_countries is None and 'country' in data:
+            raw_countries = data.get('country')
+        try:
+            countries_payload = _normalize_country_list(raw_countries)
+        except CountryPayloadError as exc:
+            return jsonify({'error': exc.code, 'message': exc.message}), 400
     for field in ['supplier','carrier','plate','driver','type','eta','status','note','customs_info','currency','assignee_id','responsible','location','category']:
         if field in data and can_set(field): setattr(a,field,data[field])
     if 'order_date' in data and can_set('order_date'): a.order_date=_parse_iso(data.get('order_date'))
@@ -266,7 +477,68 @@ def update_arrival(id):
     if 'freight_cost' in data and can_set('freight_cost'): a.freight_cost=_parse_float(data.get('freight_cost'))
     if 'customs_cost' in data and can_set('customs_cost'): a.customs_cost=_parse_float(data.get('customs_cost'))
     if 'pickup_date' in data and can_set('pickup_date'): a.pickup_date=_parse_iso(data.get('pickup_date'))
-    if 'goods_cost' in data and can_set('goods_cost'): a.goods_cost=_parse_float(data.get('goods_cost'))
+    if 'country' in data and can_set('country'):
+        try:
+            a.country = _normalize_country_code(data.get('country'))
+        except ValueError:
+            return jsonify({'error': 'invalid_country', 'message': 'neispravan kod države'}), 400
+    if suppliers_payload is not None:
+        existing_by_supplier = {link.supplier_id: link for link in list(a.suppliers)}
+        keep_supplier_ids = set()
+        for entry in suppliers_payload:
+            sid = entry['supplier_id']
+            keep_supplier_ids.add(sid)
+            link = existing_by_supplier.get(sid)
+            if link:
+                link.supplier_id = entry['supplier_id']
+                link.goods_value = entry['value']
+                link.currency = entry['currency']
+                link.note = entry['note']
+                if entry['supplier']:
+                    link.supplier = entry['supplier']
+            else:
+                a.suppliers.append(ArrivalSupplier(
+                    supplier_id=entry['supplier_id'],
+                    supplier=entry['supplier'],
+                    goods_value=entry['value'],
+                    currency=entry['currency'],
+                    note=entry['note'],
+                ))
+        for link in list(a.suppliers):
+            if link.supplier_id not in keep_supplier_ids:
+                db.session.delete(link)
+        a.supplier = _dedup_join_supplier_names(a.suppliers)
+        supplier_total = _recalculate_arrival_supplier_totals(a)
+        if not list(a.suppliers or []):
+            if 'goods_cost' in data and can_set('goods_cost'):
+                a.goods_cost = _parse_float(data.get('goods_cost'))
+        elif not supplier_total and 'goods_cost' in data and can_set('goods_cost'):
+            a.goods_cost = _parse_float(data.get('goods_cost'))
+    else:
+        # No supplier payload provided; allow explicit goods_cost update for legacy flows
+        if 'goods_cost' in data and can_set('goods_cost'):
+            a.goods_cost=_parse_float(data.get('goods_cost'))
+    if countries_payload is not None and can_set('country'):
+        existing_codes = {(link.code or "").upper(): link for link in list(a.countries)}
+        keep_codes = set()
+        for code in countries_payload:
+            keep_codes.add(code)
+            if code not in existing_codes:
+                a.countries.append(ArrivalCountry(code=code))
+        for link in list(a.countries):
+            if (link.code or "").upper() not in keep_codes:
+                db.session.delete(link)
+        a.country = countries_payload[0] if countries_payload else None
+    elif 'country' in data and can_set('country'):
+        try:
+            normalized_single = _normalize_country_code(data.get('country'))
+        except ValueError:
+            return jsonify({'error': 'invalid_country', 'message': 'neispravan kod države'}), 400
+        a.country = normalized_single
+        if normalized_single:
+            existing_codes = {(link.code or "").upper() for link in list(a.countries)}
+            if normalized_single not in existing_codes:
+                a.countries.append(ArrivalCountry(code=normalized_single))
     db.session.commit()
     # Notify meaningful changes (eta/location/note)
     try:

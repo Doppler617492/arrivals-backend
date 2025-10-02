@@ -1,6 +1,7 @@
 # models.py
 from datetime import datetime
 from extensions import db
+from countries import EUROPEAN_COUNTRIES
 
 # --- Users ---
 class User(db.Model):
@@ -131,6 +132,7 @@ class Arrival(db.Model):
     goods_cost     = db.Column(db.Float)
     customs_cost   = db.Column(db.Float)
     currency       = db.Column(db.String(8), default="EUR")
+    country        = db.Column(db.String(2), index=True)
 
     responsible    = db.Column(db.String(255))
     location       = db.Column(db.String(255))
@@ -141,8 +143,30 @@ class Arrival(db.Model):
 
     files          = db.relationship(ArrivalFile, backref="arrival", cascade="all, delete-orphan", lazy="select")
     updates        = db.relationship(ArrivalUpdate, backref="arrival", cascade="all, delete-orphan", lazy="select")
+    countries      = db.relationship(
+        "ArrivalCountry",
+        backref="arrival",
+        cascade="all, delete-orphan",
+        lazy="select",
+        order_by="ArrivalCountry.id",
+    )
+    suppliers      = db.relationship(
+        "ArrivalSupplier",
+        backref="arrival",
+        cascade="all, delete-orphan",
+        lazy="select",
+        order_by="ArrivalSupplier.id",
+    )
 
     def to_dict(self):
+        country_codes = [
+            (link.code or "").upper()
+            for link in getattr(self, "countries", [])
+            if getattr(link, "code", None)
+        ]
+        if not country_codes and (self.country or "").strip():
+            country_codes = [(self.country or "").upper()]
+        primary_country = country_codes[0] if country_codes else ((self.country or "").upper() or None)
         return {
             "id": self.id,
             "supplier": self.supplier or "",
@@ -164,11 +188,119 @@ class Arrival(db.Model):
             "goods_cost": self.goods_cost,
             "customs_cost": self.customs_cost,
             "currency": self.currency or "EUR",
+            "country": primary_country,
+            "countries": country_codes,
+            "countries_verbose": (
+                [
+                    {
+                        "code": (link.code or "").upper(),
+                        "name": EUROPEAN_COUNTRIES.get((link.code or "").upper(), (link.code or "").upper()),
+                    }
+                    for link in getattr(self, "countries", [])
+                    if getattr(link, "code", None)
+                ]
+                if getattr(self, "countries", [])
+                else [
+                    {
+                        "code": code,
+                        "name": EUROPEAN_COUNTRIES.get(code, code),
+                    }
+                    for code in country_codes
+                ]
+            ),
             "responsible": self.responsible or "",
             "location": self.location or "",
             "assignee_id": self.assignee_id,
             "created_at": (self.created_at or datetime.utcnow()).isoformat(),
             "updated_at": (self.updated_at or datetime.utcnow()).isoformat(),
+            "suppliers": [link.to_dict() for link in getattr(self, "suppliers", [])],
+            "suppliers_value_total": sum(
+                float(link.goods_value or 0.0) for link in getattr(self, "suppliers", [])
+            ),
+        }
+
+
+class ArrivalCountry(db.Model):
+    __tablename__ = "arrival_countries"
+    __table_args__ = (
+        db.UniqueConstraint("arrival_id", "code", name="uq_arrival_country"),
+    )
+
+    id          = db.Column(db.Integer, primary_key=True)
+    arrival_id  = db.Column(
+        db.Integer,
+        db.ForeignKey("arrivals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    code        = db.Column(db.String(2), nullable=False, index=True)
+    created_at  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at  = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        code_upper = (self.code or "").upper()
+        return {
+            "code": code_upper,
+            "name": EUROPEAN_COUNTRIES.get(code_upper, code_upper),
+        }
+
+
+class Supplier(db.Model):
+    __tablename__ = "suppliers"
+    id                = db.Column(db.Integer, primary_key=True)
+    name              = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    default_currency  = db.Column(db.String(8), default="EUR")
+    is_active         = db.Column(db.Boolean, default=True, index=True)
+    created_at        = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at        = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "default_currency": (self.default_currency or "EUR").upper(),
+            "is_active": bool(self.is_active),
+        }
+
+
+class ArrivalSupplier(db.Model):
+    __tablename__ = "arrival_suppliers"
+    __table_args__ = (
+        db.UniqueConstraint("arrival_id", "supplier_id", name="uq_arrival_supplier"),
+    )
+
+    id           = db.Column(db.Integer, primary_key=True)
+    arrival_id   = db.Column(
+        db.Integer,
+        db.ForeignKey("arrivals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    supplier_id  = db.Column(
+        db.Integer,
+        db.ForeignKey("suppliers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    goods_value  = db.Column(db.Float)
+    currency     = db.Column(db.String(8), default="EUR")
+    note         = db.Column(db.Text)
+    created_at   = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at   = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    supplier     = db.relationship(Supplier, backref=db.backref("arrival_links", lazy="dynamic"))
+
+    def to_dict(self):
+        supplier_data = self.supplier.to_dict() if self.supplier else None
+        return {
+            "id": self.id,
+            "arrival_id": self.arrival_id,
+            "supplier_id": self.supplier_id,
+            "supplier": supplier_data,
+            "supplier_name": supplier_data.get("name") if supplier_data else None,
+            "value": self.goods_value,
+            "currency": (self.currency or (supplier_data or {}).get("default_currency") or "EUR").upper(),
+            "note": self.note or "",
         }
 
 # --- Containers ---

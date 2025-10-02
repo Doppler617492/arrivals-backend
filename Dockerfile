@@ -24,10 +24,12 @@ COPY . /app
 # (Optional) set Flask env vars if your app reads them
 ENV FLASK_APP=app.py
 
+# Provide an entrypoint that runs migrations before the server boots
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
 EXPOSE 8081
 
-# Start with Gunicorn in production
-# If your Flask instance is named "app" inside app.py, this works:
-# Use a WebSocket-capable worker so Flask-Sock /ws works
-# Requires gevent + gevent-websocket (added to requirements.txt)
+# Use the entrypoint to apply migrations, then start Gunicorn (WebSocket-capable worker)
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["gunicorn", "-k", "geventwebsocket.gunicorn.workers.GeventWebSocketWorker", "-w", "2", "--timeout", "90", "-b", "0.0.0.0:8081", "app:app"]

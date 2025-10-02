@@ -1,7 +1,7 @@
 """add code/status/note/arrived_at to containers
 
 Revision ID: 033b50f0825b
-Revises: d817250d8f52
+Revises: d817250d8f52_baseline
 Create Date: 2025-09-15 00:00:00
 """
 from typing import Sequence, Union
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "033b50f0825b"
-down_revision: Union[str, Sequence[str], None] = "d817250d8f52"
+down_revision: Union[str, Sequence[str], None] = "d817250d8f52_baseline"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

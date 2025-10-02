@@ -7,6 +7,7 @@ Create Date: 2025-09-19 12:00:00.000000
 """
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import inspect
 
 # revision identifiers, used by Alembic.
 revision = '7b1c_users_enterprise'
@@ -17,29 +18,32 @@ depends_on = None
 
 def upgrade() -> None:
     # users extra columns (idempotent adds)
+    bind = op.get_bind()
+    inspector = inspect(bind)
+    existing_columns = {col.get('name') for col in inspector.get_columns('users')}
     with op.batch_alter_table('users') as batch:
-        try: batch.add_column(sa.Column('username', sa.String(length=255), nullable=True))
-        except Exception: pass
-        try: batch.add_column(sa.Column('phone', sa.String(length=64), nullable=True))
-        except Exception: pass
-        try: batch.add_column(sa.Column('status', sa.String(length=32), nullable=True))
-        except Exception: pass
-        try: batch.add_column(sa.Column('type', sa.String(length=32), nullable=True))
-        except Exception: pass
-        try: batch.add_column(sa.Column('last_activity_at', sa.DateTime(), nullable=True))
-        except Exception: pass
-        try: batch.add_column(sa.Column('last_login_at', sa.DateTime(), nullable=True))
-        except Exception: pass
-        try: batch.add_column(sa.Column('failed_logins', sa.Integer(), nullable=True))
-        except Exception: pass
-        try: batch.add_column(sa.Column('must_change_password', sa.Boolean(), nullable=True))
-        except Exception: pass
-        try: batch.add_column(sa.Column('require_password_change', sa.Boolean(), nullable=True))
-        except Exception: pass
-        try: batch.add_column(sa.Column('note', sa.Text(), nullable=True))
-        except Exception: pass
-        try: batch.add_column(sa.Column('deleted_at', sa.DateTime(), nullable=True))
-        except Exception: pass
+        if 'username' not in existing_columns:
+            batch.add_column(sa.Column('username', sa.String(length=255), nullable=True))
+        if 'phone' not in existing_columns:
+            batch.add_column(sa.Column('phone', sa.String(length=64), nullable=True))
+        if 'status' not in existing_columns:
+            batch.add_column(sa.Column('status', sa.String(length=32), nullable=True))
+        if 'type' not in existing_columns:
+            batch.add_column(sa.Column('type', sa.String(length=32), nullable=True))
+        if 'last_activity_at' not in existing_columns:
+            batch.add_column(sa.Column('last_activity_at', sa.DateTime(), nullable=True))
+        if 'last_login_at' not in existing_columns:
+            batch.add_column(sa.Column('last_login_at', sa.DateTime(), nullable=True))
+        if 'failed_logins' not in existing_columns:
+            batch.add_column(sa.Column('failed_logins', sa.Integer(), nullable=True))
+        if 'must_change_password' not in existing_columns:
+            batch.add_column(sa.Column('must_change_password', sa.Boolean(), nullable=True))
+        if 'require_password_change' not in existing_columns:
+            batch.add_column(sa.Column('require_password_change', sa.Boolean(), nullable=True))
+        if 'note' not in existing_columns:
+            batch.add_column(sa.Column('note', sa.Text(), nullable=True))
+        if 'deleted_at' not in existing_columns:
+            batch.add_column(sa.Column('deleted_at', sa.DateTime(), nullable=True))
 
     # roles
     op.create_table('roles',
