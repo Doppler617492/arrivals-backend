@@ -132,7 +132,7 @@ class Arrival(db.Model):
     goods_cost     = db.Column(db.Float)
     customs_cost   = db.Column(db.Float)
     currency       = db.Column(db.String(8), default="EUR")
-    country        = db.Column(db.String(2), index=True)
+    country        = db.Column(db.String(10), index=True)
 
     responsible    = db.Column(db.String(255))
     location       = db.Column(db.String(255))
