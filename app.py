@@ -1242,11 +1242,11 @@ if os.environ.get('AUTO_CREATE_TABLES', '1').lower() in ('1','true','yes','on'):
 ROLE_FIELDS = {
     'admin': {'supplier','carrier','plate','type','eta','status','note','order_date','production_due',
               'shipped_at','arrived_at','customs_info','freight_cost','customs_cost','currency','assignee_id',
-              'driver','pickup_date','goods_cost','responsible','location','category'},
+              'driver','pickup_date','goods_cost','responsible','location','category','country','suppliers'},
     'manager': {'supplier','carrier','plate','type','eta','status','note','order_date','production_due',
                 'shipped_at','arrived_at','customs_info','freight_cost','customs_cost','currency','assignee_id',
-                'driver','pickup_date','goods_cost','responsible','location','category'},
-    'planer': {'supplier','order_date','production_due','status','note','location','category'},
+                'driver','pickup_date','goods_cost','responsible','location','category','country','suppliers'},
+    'planer': {'supplier','order_date','production_due','status','note','location','category','country'},
     'proizvodnja': {'status','note'},
     'transport': {'carrier','plate','eta','status','shipped_at','note','driver','pickup_date','freight_cost','location'},
     'carina': {'status','customs_info','customs_cost','note'},
@@ -2492,7 +2492,9 @@ def import_containers():
             for c in cols:
                 cc = norm(str(c))
                 for ta in norm_aliases:
-                    if ta and (ta in cc or cc in ta):
+                    if not ta:
+                        continue
+                    if ta in cc or (len(cc) >= 3 and cc in ta):
                         val = row[c]
                         if pd.notna(val):
                             return val
@@ -2722,7 +2724,9 @@ def import_containers_local():
             for c in cols:
                 cc = norm(str(c))
                 for ta in norm_aliases:
-                    if ta and (ta in cc or cc in ta):
+                    if not ta:
+                        continue
+                    if ta in cc or (len(cc) >= 3 and cc in ta):
                         val = row[c]
                         if pd.notna(val):
                             return val
@@ -3208,6 +3212,10 @@ _register_blueprint(["routes.users_enterprise", "routes.enterprise_users"], labe
 # The 'containers' blueprint in containers.py already defines url_prefix='/api/containers'.
 # Register without forcing an extra prefix to avoid '/api/containers/api/containers'.
 _register_blueprint(["routes.containers", "containers"], label="containers")
+
+
+# Suppliers blueprint (list/create suppliers)
+_register_blueprint(["routes.suppliers", "suppliers"], label="suppliers")
 
 
 # Files blueprint
