@@ -11,6 +11,8 @@ These folders survive `docker compose down -v` because they are bind‑mounts, n
 ## Compose services (arrivals-backend/docker-compose.yml)
 - `backend` (Gunicorn WS worker on 8081)
 - `db` (Postgres 16)
+- `redis` (Redis 7 for Celery + caching)
+- `celery` (background worker processing async jobs)
 
 Key env in `backend`:
 - `DATABASE_URL` — Postgres connection, e.g. `postgresql+psycopg://arrivals:supersecretchangeit@db:5432/arrivals`
@@ -76,7 +78,7 @@ psql -h 127.0.0.1 -p 5432 -U arrivals -d arrivals < arrivals_backup.sql
 (Replace user/password/port if different. When using Docker Desktop, you can exec into the db container and run pg_dump/psql there.)
 
 ## Health & Routes
-- Health: `GET http://localhost:8081/health` — DB connectivity + Alembic info
+- Health: `GET http://localhost:8081/healthz` — DB connectivity check used by the Docker healthcheck
 - Arrivals routes: `GET http://localhost:8081/_debug/arrivals-methods`
 - All routes: `GET http://localhost:8081/_debug/routes`
 
@@ -84,3 +86,5 @@ psql -h 127.0.0.1 -p 5432 -U arrivals -d arrivals < arrivals_backup.sql
 - 405 on PATCH/POST/DELETE: make sure you’re hitting the WS‑capable backend on 8081 started by this compose. Check `docker compose ps` and restart with `--build`.
 - WebSocket “bad response”: ensure the backend is started with the Gevent WebSocket worker (this compose does that).
 - Data missing after restart: don’t worry — with bind‑mounts, DB and uploads persist. If you were using another compose earlier, confirm you’re now running this one.
+- Need to flush cached lookups quickly? Call `POST /api/admin/cache/clear` with an admin/API token.
+- Background jobs such as the demo bulk email endpoint return a `task_id`. Poll `GET /api/tasks/<task_id>` to track progress.

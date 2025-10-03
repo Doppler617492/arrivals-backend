@@ -15,6 +15,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       - TZ=Europe/Podgorica
       - MAIL_DEBUG=0
@@ -24,8 +26,17 @@ services:
       - API_KEY=devkey123
       - ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
       - LOG_HTTP=1
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL:-redis://redis:6379/0}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+      - CACHE_REDIS_URL=${CACHE_REDIS_URL:-redis://redis:6379/0}
     volumes:
       - ./uploads:/app/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
 
   db:
     image: postgres:16-alpine
@@ -43,5 +54,34 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: arrivals-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg://arrivals:supersecretchangeit@db:5432/arrivals}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL:-redis://redis:6379/0}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+      - CACHE_REDIS_URL=${CACHE_REDIS_URL:-redis://redis:6379/0}
+    command: celery -A celery_app.celery_app worker --loglevel=info
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes: {}

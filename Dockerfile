@@ -12,6 +12,7 @@ WORKDIR /app
 # System deps (if you use SQLite only, this is enough)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # If you have a requirements.txt, copy & install first to leverage Docker layer caching

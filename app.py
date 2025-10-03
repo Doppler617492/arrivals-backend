@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory, redirect
+from flask import Flask, request, jsonify, send_from_directory, redirect, g, current_app, has_request_context
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from flask_jwt_extended import (
@@ -28,13 +28,14 @@ import smtplib
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 import logging
-import structlog
+from pythonjsonlogger import jsonlogger
 import json
 import base64
 import ssl
 import urllib.request
 import urllib.error
 import urllib.parse
+import uuid
 
 # Optional/legacy modules (guarded so app can start even if they don't exist)
 try:
@@ -51,13 +52,15 @@ load_dotenv()
 
 # --- Modular config/extensions (safe import with fallbacks) ---
 try:
-    from extensions import db, jwt  # externalized singletons
+    from extensions import db, jwt, cache  # externalized singletons
 except Exception:
     # Fallback definitions if extensions.py doesn't exist yet
     from flask_sqlalchemy import SQLAlchemy
     from flask_jwt_extended import JWTManager
+    from flask_caching import Cache
     db = SQLAlchemy()
     jwt = JWTManager()
+    cache = Cache()
 
 try:
     from config import load_config, allowed_origins
@@ -98,34 +101,33 @@ app = Flask(__name__)
 AUTO_CREATE_TABLES_ENABLED = (os.environ.get('AUTO_CREATE_TABLES', '0') or '').strip().lower() in ('1','true','yes','on')
 
 # --- Logging (JSON/structured) ---
-def _configure_logging():
-    try:
-        timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
-        structlog.configure(
-            processors=[
-                structlog.processors.add_log_level,
-                timestamper,
-                structlog.processors.StackInfoRenderer(),
-                structlog.processors.format_exc_info,
-                structlog.processors.JSONRenderer(),
-            ],
-            wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-            context_class=dict,
-            cache_logger_on_first_use=True,
-        )
-        # Bridge stdlib logging to structlog
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        root = logging.getLogger()
-        root.handlers = [handler]
-        root.setLevel(logging.INFO)
-        # Example startup log
-        structlog.get_logger("startup").info("backend_boot", pid=os.getpid())
-    except Exception as _log_err:
-        try:
-            print("[LOG] structlog setup failed:", _log_err)
-        except Exception:
-            pass
+
+
+class RequestContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+        if has_request_context():
+            record.request_id = getattr(g, "request_id", None)
+            record.path = getattr(g, "request_path", None)
+            record.user_id = getattr(g, "request_user_id", None)
+        else:
+            record.request_id = None
+            record.path = None
+            record.user_id = None
+        return True
+
+
+def _configure_logging() -> None:
+    formatter = jsonlogger.JsonFormatter(
+        "%(asctime)s %(levelname)s %(name)s %(message)s %(request_id)s %(path)s %(user_id)s",
+        rename_fields={"levelname": "level", "asctime": "timestamp"},
+    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    handler.addFilter(RequestContextFilter())
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+    root.info("backend_boot", extra={"pid": os.getpid()})
 
 _configure_logging()
 
@@ -135,6 +137,9 @@ ALLOWED_ORIGINS = allowed_origins()
 
 # Core blueprint (enabled now that overlapping routes are removed)
 from routes.core import bp as core_bp
+from celery_app import init_celery, celery_app
+from tasks import send_bulk_email_task
+from celery.result import AsyncResult
 app.register_blueprint(core_bp, url_prefix="")
 
 
@@ -166,6 +171,7 @@ CORS(
         r"/auth/*": {"origins": ALLOWED_ORIGINS},
         r"/files/*": {"origins": ALLOWED_ORIGINS},
         r"/health": {"origins": ALLOWED_ORIGINS},
+        r"/healthz": {"origins": ALLOWED_ORIGINS},
         r"/": {"origins": ALLOWED_ORIGINS},
     },
     supports_credentials=True,
@@ -175,8 +181,38 @@ CORS(
     max_age=86400,
 )
 
+
+@app.get('/healthz')
+def healthz():
+    try:
+        db.session.execute(text('SELECT 1'))
+        return jsonify({'status': 'ok'}), 200
+    except Exception as exc:
+        current_app.logger.exception('health_check_failed', extra={'error': str(exc)})
+        return jsonify({'status': 'error', 'detail': str(exc)}), 500
+
 # Optional HTTPS enforcement and secure headers
 ENFORCE_HTTPS = (os.environ.get('ENFORCE_HTTPS', '0').lower() in ('1','true','yes','on'))
+
+
+@app.before_request
+def _request_context_filters():
+    request_id = request.headers.get('X-Request-ID') or str(uuid.uuid4())
+    g.request_id = request_id
+    g.request_path = request.path
+    g.request_user_id = None
+    try:
+        verify_jwt_in_request(optional=True)
+        g.request_user_id = get_jwt_identity()
+    except Exception:
+        pass
+
+
+@app.after_request
+def _inject_request_id_header(response):
+    if getattr(g, 'request_id', None):
+        response.headers['X-Request-ID'] = g.request_id
+    return response
 
 if ENFORCE_HTTPS:
     @app.before_request
@@ -447,6 +483,14 @@ def __routes():
 
 # --- Config ---
 load_config(app)
+app.config.setdefault('CELERY_BROKER_URL', os.environ.get('CELERY_BROKER_URL', os.environ.get('CACHE_REDIS_URL', os.environ.get('REDIS_URL', 'redis://redis:6379/0'))))
+app.config.setdefault('CELERY_RESULT_BACKEND', os.environ.get('CELERY_RESULT_BACKEND', app.config['CELERY_BROKER_URL']))
+app.config.setdefault('CACHE_TYPE', 'RedisCache')
+app.config.setdefault('CACHE_DEFAULT_TIMEOUT', int(os.environ.get('CACHE_DEFAULT_TIMEOUT', '600')))
+app.config.setdefault('CACHE_REDIS_URL', os.environ.get('CACHE_REDIS_URL', app.config['CELERY_BROKER_URL']))
+
+cache.init_app(app)
+init_celery(app)
 
 # Mail / SLA
 # Sensible defaults for Gmail (App Password required):
@@ -2754,6 +2798,7 @@ def kpi():
     return jsonify({'total': total, 'by_status': counts})
 # Options for dropdowns
 @app.get('/api/options/responsibles')
+@cache.cached(timeout=600, key_prefix='options_responsibles')
 def options_responsibles():
     # Allow env-based override: RESPONSIBLES="Ludvig,Gazi,Gezim,Armir"
     from_env = (os.environ.get('RESPONSIBLES') or '').strip()
@@ -2763,6 +2808,7 @@ def options_responsibles():
         vals = ["Ludvig", "Gazi", "Gezim", "Armir"]
     return jsonify(vals)
 
+@cache.memoize(timeout=600)
 def _compute_locations_list():
     """
     1) LOCATIONS iz .env (comma-separated) ako postoji,
@@ -2814,6 +2860,53 @@ def options_locations():
     Reuses the canonical computation used by /api/locations.
     """
     return jsonify(_compute_locations_list())
+
+
+@app.post('/api/admin/cache/clear')
+def admin_cache_clear():
+    ok, role, uid, err = check_api_or_jwt({'cache_clear'})
+    if not ok:
+        return err
+    if role != 'admin':
+        return jsonify({'error': 'Forbidden'}), 403
+    cache.clear()
+    return jsonify({'ok': True, 'message': 'Cache cleared'})
+
+
+@app.post('/api/admin/bulk-email')
+def admin_bulk_email():
+    ok, role, uid, err = check_api_or_jwt({'bulk_email'})
+    if not ok:
+        return err
+    if role != 'admin':
+        return jsonify({'error': 'Forbidden'}), 403
+
+    payload = request.get_json(silent=True) or {}
+    recipients = payload.get('recipients') or []
+    if not isinstance(recipients, (list, tuple)) or not recipients:
+        return jsonify({'error': 'invalid_recipients', 'message': 'Provide recipients as a non-empty list'}), 400
+    recipients = [str(r).strip() for r in recipients if str(r).strip()]
+    if not recipients:
+        return jsonify({'error': 'invalid_recipients', 'message': 'Provide recipients as a non-empty list'}), 400
+
+    subject = str(payload.get('subject') or '').strip() or 'Arrivals bulk notice'
+    body = str(payload.get('body') or '').strip() or 'Hello from Arrivals.'
+
+    task = send_bulk_email_task.delay(recipients, subject, body)
+    return jsonify({'task_id': task.id}), 202
+
+
+@app.get('/api/tasks/<task_id>')
+def get_task_status(task_id):
+    result = AsyncResult(task_id, app=celery_app)
+    response = {'task_id': task_id, 'state': result.state}
+    if result.successful():
+        response['result'] = result.result
+    elif result.failed():
+        response['error'] = str(result.result)
+    elif result.info:
+        response['info'] = result.info
+    return jsonify(response)
 
 def _parse_boolish(val):
     """
